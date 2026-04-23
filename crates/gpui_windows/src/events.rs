@@ -14,7 +14,7 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::PCWSTR,
+    core::{PCWSTR, w},
 };
 
 use crate::*;
@@ -30,6 +30,14 @@ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+const SIZE_MOVE_SETTLE_TIMER_ID: usize = 2;
+const SIZE_MOVE_SETTLE_DELAY_MS: u32 = 50;
+const GPUI_PASSTHROUGH_PROP: PCWSTR = w!("GPUI::PassthroughOverlay");
+
+#[inline]
+fn is_passthrough_window(handle: HWND) -> bool {
+    unsafe { !GetPropW(handle, GPUI_PASSTHROUGH_PROP).is_invalid() }
+}
 
 impl WindowsWindowInner {
     pub(crate) fn handle_msg(
@@ -223,6 +231,27 @@ impl WindowsWindowInner {
         }
     }
 
+    fn sync_client_rect_size(&self, handle: HWND, force_render: bool) {
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(handle, &mut rect) }.is_err() {
+            return;
+        }
+
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        let scale_factor = self.state.scale_factor.get();
+        let device_size = size(DevicePixels(width), DevicePixels(height));
+        let new_logical_size = device_size.to_pixels(scale_factor);
+        let should_resize_renderer =
+            force_render || self.state.logical_size.get() != new_logical_size;
+
+        self.handle_size_change(device_size, scale_factor, should_resize_renderer);
+
+        if force_render {
+            let _ = self.draw_window(handle, true);
+        }
+    }
+
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
         unsafe {
             let ret = SetTimer(
@@ -244,8 +273,31 @@ impl WindowsWindowInner {
     fn handle_size_move_loop_exit(&self, handle: HWND) -> Option<isize> {
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
+            KillTimer(Some(handle), SIZE_MOVE_SETTLE_TIMER_ID).log_err();
         }
-        None
+
+        // Windows snap/maximize via drag-to-top can leave the renderer one frame behind the
+        // actual client rect. Re-sample the final client area once the move/size modal loop
+        // has completed and force a redraw so the content catches up immediately.
+        self.sync_client_rect_size(handle, true);
+
+        // Some Windows 11 snap/maximize paths finish settling slightly after WM_EXITSIZEMOVE.
+        // Schedule one more short re-check against the real client rect to catch that final size.
+        unsafe {
+            let ret = SetTimer(
+                Some(handle),
+                SIZE_MOVE_SETTLE_TIMER_ID,
+                SIZE_MOVE_SETTLE_DELAY_MS,
+                None,
+            );
+            if ret == 0 {
+                log::error!(
+                    "unable to create settle timer after move/size loop: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Some(0)
     }
 
     fn handle_timer_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
@@ -255,6 +307,12 @@ impl WindowsWindowInner {
                 WindowsDispatcher::execute_runnable(runnable);
             }
             self.handle_paint_msg(handle)
+        } else if wparam.0 == SIZE_MOVE_SETTLE_TIMER_ID {
+            unsafe {
+                KillTimer(Some(handle), SIZE_MOVE_SETTLE_TIMER_ID).log_err();
+            }
+            self.sync_client_rect_size(handle, true);
+            Some(0)
         } else {
             None
         }
@@ -888,8 +946,8 @@ impl WindowsWindowInner {
     }
 
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
-        if !self.is_movable || self.state.is_fullscreen() {
-            return None;
+        if is_passthrough_window(handle) {
+            return Some(HTTRANSPARENT as _);
         }
 
         let callback = self.state.callbacks.hit_test_window_control.take();
@@ -901,7 +959,13 @@ impl WindowsWindowInner {
                 .set(Some(callback));
             if let Some(area) = area {
                 match area {
-                    WindowControlArea::Drag => Some(HTCAPTION as _),
+                    WindowControlArea::Drag => {
+                        if self.is_movable && !self.state.is_fullscreen() {
+                            Some(HTCAPTION as _)
+                        } else {
+                            None
+                        }
+                    }
                     WindowControlArea::Close => return Some(HTCLOSE as _),
                     WindowControlArea::Max => return Some(HTMAXBUTTON as _),
                     WindowControlArea::Min => return Some(HTMINBUTTON as _),
@@ -912,6 +976,10 @@ impl WindowsWindowInner {
         } else {
             None
         };
+
+        if !self.is_movable || self.state.is_fullscreen() {
+            return drag_area;
+        }
 
         if !self.hide_title_bar {
             // If the OS draws the title bar, we don't need to handle hit test messages.
