@@ -852,6 +852,18 @@ impl PlatformWindow for WindowsWindow {
         }
     }
 
+    fn start_window_move(&self) {
+        unsafe {
+            let _ = ReleaseCapture();
+            let _ = SendMessageW(
+                self.0.hwnd,
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+
     fn toggle_fullscreen(&self) {
         if unsafe { IsWindowVisible(self.0.hwnd).as_bool() } {
             self.0.toggle_fullscreen();
