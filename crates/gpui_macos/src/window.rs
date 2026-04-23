@@ -280,6 +280,10 @@ unsafe fn build_classes() {
                     sel!(acceptsFirstMouse:),
                     accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
                 );
+                decl.add_method(
+                    sel!(mouseDownCanMoveWindow),
+                    mouse_down_can_move_window as extern "C" fn(&Object, Sel) -> BOOL,
+                );
 
                 decl.add_method(
                     sel!(characterIndexForPoint:),
@@ -805,6 +809,7 @@ impl MacWindow {
             }
 
             native_window.setMovable_(is_movable as BOOL);
+            let _: () = msg_send![native_window, setMovableByWindowBackground: NO];
 
             if let Some(window_min_size) = window_min_size {
                 native_window.setContentMinSize_(NSSize {
@@ -1743,6 +1748,10 @@ unsafe fn drop_window_state(object: &Object) {
 
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
+}
+
+extern "C" fn mouse_down_can_move_window(_: &Object, _: Sel) -> BOOL {
+    NO
 }
 
 extern "C" fn dealloc_window(this: &Object, _: Sel) {

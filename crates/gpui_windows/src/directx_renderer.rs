@@ -1576,15 +1576,19 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
 const BUFFER_COUNT: usize = 3;
 
 pub(crate) mod shader_resources {
+    use std::sync::OnceLock;
+
     use anyhow::Result;
 
-    #[cfg(debug_assertions)]
     use windows::{
         Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
             ID3DBlob,
+            Fxc::{
+                D3DCOMPILE_DEBUG, D3DCOMPILE_ENABLE_STRICTNESS,
+                D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile,
+            },
         },
-        core::{HSTRING, PCSTR},
+        core::PCSTR,
     };
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1606,91 +1610,124 @@ pub(crate) mod shader_resources {
         Fragment,
     }
 
-    pub(crate) struct RawShaderBytes<'t> {
-        inner: &'t [u8],
-
-        #[cfg(debug_assertions)]
-        _blob: ID3DBlob,
+    pub(crate) struct RawShaderBytes {
+        bytes: &'static [u8],
     }
 
-    impl<'t> RawShaderBytes<'t> {
+    impl RawShaderBytes {
         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
-            #[cfg(not(debug_assertions))]
-            {
-                Ok(Self::from_bytes(module, target))
-            }
-            #[cfg(debug_assertions)]
-            {
-                let blob = build_shader_blob(module, target)?;
-                let inner = unsafe {
-                    std::slice::from_raw_parts(
-                        blob.GetBufferPointer() as *const u8,
-                        blob.GetBufferSize(),
-                    )
-                };
-                Ok(Self { inner, _blob: blob })
-            }
+            let bytes = cached_shader_bytes(module, target)?;
+            Ok(Self { bytes })
         }
 
-        pub(crate) fn as_bytes(&'t self) -> &'t [u8] {
-            self.inner
-        }
-
-        #[cfg(not(debug_assertions))]
-        fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
-            let bytes = match module {
-                ShaderModule::Quad => match target {
-                    ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
-                    ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
-                },
-                ShaderModule::Shadow => match target {
-                    ShaderTarget::Vertex => SHADOW_VERTEX_BYTES,
-                    ShaderTarget::Fragment => SHADOW_FRAGMENT_BYTES,
-                },
-                ShaderModule::Underline => match target {
-                    ShaderTarget::Vertex => UNDERLINE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => UNDERLINE_FRAGMENT_BYTES,
-                },
-                ShaderModule::PathRasterization => match target {
-                    ShaderTarget::Vertex => PATH_RASTERIZATION_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_RASTERIZATION_FRAGMENT_BYTES,
-                },
-                ShaderModule::PathSprite => match target {
-                    ShaderTarget::Vertex => PATH_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::MonochromeSprite => match target {
-                    ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => MONOCHROME_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::SubpixelSprite => match target {
-                    ShaderTarget::Vertex => SUBPIXEL_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => SUBPIXEL_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::PolychromeSprite => match target {
-                    ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::EmojiRasterization => match target {
-                    ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
-                    ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
-                },
-            };
-            Self { inner: bytes }
+        pub(crate) fn as_bytes(&self) -> &[u8] {
+            self.bytes
         }
     }
 
-    #[cfg(debug_assertions)]
+    fn cached_shader_bytes(module: ShaderModule, target: ShaderTarget) -> Result<&'static [u8]> {
+        let cache = match (module, target) {
+            (ShaderModule::Quad, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::Quad, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::Shadow, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::Shadow, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::Underline, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::Underline, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::PathRasterization, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::PathRasterization, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::PathSprite, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::PathSprite, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::MonochromeSprite, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::MonochromeSprite, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::SubpixelSprite, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::SubpixelSprite, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::PolychromeSprite, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::PolychromeSprite, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::EmojiRasterization, ShaderTarget::Vertex) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+            (ShaderModule::EmojiRasterization, ShaderTarget::Fragment) => {
+                static CACHE: OnceLock<Box<[u8]>> = OnceLock::new();
+                &CACHE
+            }
+        };
+
+        if let Some(bytes) = cache.get() {
+            return Ok(bytes.as_ref());
+        }
+
+        let blob = build_shader_blob(module, target)?;
+        let compiled = unsafe {
+            std::slice::from_raw_parts(
+                blob.GetBufferPointer() as *const u8,
+                blob.GetBufferSize(),
+            )
+        }
+        .to_vec()
+        .into_boxed_slice();
+
+        let _ = cache.set(compiled);
+        Ok(cache
+            .get()
+            .expect("shader bytes should be cached after compilation")
+            .as_ref())
+    }
+
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
         unsafe {
-            use windows::Win32::Graphics::{
-                Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
-            };
-
-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                "color_text_raster.hlsl"
+            let source = if matches!(entry, ShaderModule::EmojiRasterization) {
+                shader_source(include_str!("alpha_correction.hlsl"), include_str!("color_text_raster.hlsl"))
             } else {
-                "shaders.hlsl"
+                shader_source(include_str!("alpha_correction.hlsl"), include_str!("shaders.hlsl"))
             };
 
             let entry = format!(
@@ -1708,25 +1745,23 @@ pub(crate) mod shader_resources {
 
             let mut compile_blob = None;
             let mut error_blob = None;
-            let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(&format!("src/{}", shader_name))
-                .canonicalize()?;
-
             let entry_point = PCSTR::from_raw(entry.as_ptr());
             let target_cstr = PCSTR::from_raw(target.as_ptr());
+            let compile_flags = if cfg!(debug_assertions) {
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+            } else {
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3
+            };
 
-            // really dirty trick because winapi bindings are unhappy otherwise
-            let include_handler = &std::mem::transmute::<usize, ID3DInclude>(
-                D3D_COMPILE_STANDARD_FILE_INCLUDE as usize,
-            );
-
-            let ret = D3DCompileFromFile(
-                &HSTRING::from(shader_path.to_str().unwrap()),
+            let ret = D3DCompile(
+                source.as_ptr() as *const _,
+                source.len(),
+                PCSTR::null(),
                 None,
-                include_handler,
+                None,
                 entry_point,
                 target_cstr,
-                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                compile_flags,
                 0,
                 &mut compile_blob,
                 Some(&mut error_blob),
@@ -1746,10 +1781,6 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(not(debug_assertions))]
-    include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
-
-    #[cfg(debug_assertions)]
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
@@ -1764,6 +1795,15 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }
+    }
+
+    fn shader_source(alpha_correction: &str, source: &str) -> String {
+        let body = source
+            .lines()
+            .skip_while(|line| line.trim_start().starts_with("#include"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{alpha_correction}\n{body}")
     }
 }
 
