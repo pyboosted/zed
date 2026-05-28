@@ -63,9 +63,10 @@ pub struct TerminalToolInput {
     ///
     /// Only meaningful when the system prompt's "Terminal sandbox" section
     /// is present — ignored otherwise. By default sandboxed commands can
-    /// only write to the project worktree directories and a per-command
-    /// temporary directory; set this to `true` only when the command
-    /// needs to write elsewhere. The user will be prompted to approve
+    /// only write to the project worktree directories, Git metadata
+    /// directories needed by those worktrees, and a per-thread temporary
+    /// directory; set this to `true` only when the command needs to write
+    /// elsewhere. The user will be prompted to approve
     /// before the command runs.
     #[serde(default)]
     pub allow_fs_write: Option<bool>,
@@ -188,21 +189,15 @@ impl AgentTool for TerminalTool {
             // scope, breaking writes into `$TMPDIR`.
             let extra_env = Vec::new();
 
-            // Build the writable scope from the project's worktrees. The
-            // per-thread temp directory is appended by the thread environment
-            // (which owns it and points `$TMPDIR` at it). Crucially we do
-            // *not* include the resolved `cd` working directory — that's
-            // model-controlled, and using it as the writable scope would
-            // let the model widen its own write permissions outside the
-            // project.
+            // Build the writable scope from the project's worktrees and the
+            // Git metadata directories those worktrees need. The per-thread
+            // temp directory is appended by the thread environment (which owns
+            // it and points `$TMPDIR` at it). Crucially we do *not* include the
+            // resolved `cd` working directory — that's model-controlled, and
+            // using it as the writable scope would let the model widen its own
+            // write permissions outside the project.
             let sandbox_wrap = if sandboxing && !want_unsandboxed {
-                let writable_paths: Vec<PathBuf> = cx.update(|cx| {
-                    self.project
-                        .read(cx)
-                        .worktrees(cx)
-                        .map(|w| w.read(cx).abs_path().to_path_buf())
-                        .collect::<Vec<_>>()
-                });
+                let writable_paths = cx.update(|cx| sandbox_writable_paths(self.project.read(cx), cx));
                 Some(acp_thread::SandboxWrap {
                     writable_paths,
                     allow_network: want_network,
@@ -387,6 +382,24 @@ fn process_content(
     content
 }
 
+fn sandbox_writable_paths(project: &Project, cx: &App) -> Vec<PathBuf> {
+    let mut writable_paths = Vec::new();
+
+    for worktree in project.worktrees(cx) {
+        let worktree = worktree.read(cx);
+        writable_paths.push(worktree.abs_path().to_path_buf());
+
+        let snapshot = worktree.snapshot();
+        if let Some(root_repo_common_dir) = snapshot.root_repo_common_dir() {
+            writable_paths.push(root_repo_common_dir.to_path_buf());
+        }
+    }
+
+    writable_paths.sort();
+    writable_paths.dedup();
+    writable_paths
+}
+
 fn working_dir(
     input: &TerminalToolInput,
     project: &Entity<Project>,
@@ -431,6 +444,7 @@ fn working_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs::Fs;
 
     #[test]
     fn test_initial_title_shows_full_multiline_command() {
@@ -460,6 +474,44 @@ mod tests {
             !title.contains("…") && !title.contains("..."),
             "Should NOT contain ellipsis"
         )
+    }
+
+    #[gpui::test]
+    async fn test_sandbox_writable_paths_include_git_common_dir_for_linked_worktree(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/main_repo",
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/main_repo/.git"),
+            false,
+            git::repository::Worktree {
+                path: PathBuf::from("/linked_worktree"),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        fs.write(Path::new("/linked_worktree/file.txt"), b"content")
+            .await
+            .unwrap();
+
+        let project = project::Project::test(fs, [Path::new("/linked_worktree")], cx).await;
+        let writable_paths = cx.update(|cx| sandbox_writable_paths(project.read(cx), cx));
+
+        assert!(writable_paths.contains(&PathBuf::from("/linked_worktree")));
+        assert!(writable_paths.contains(&PathBuf::from("/main_repo/.git")));
     }
 
     #[test]

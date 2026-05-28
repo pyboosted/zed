@@ -197,7 +197,7 @@ The `terminal` tool runs commands inside a sandbox with these permissions:
 {{#each worktrees}}
   - `{{abs_path}}`
 {{/each}}
-  Writes anywhere else on the filesystem are blocked.{{else}}. No project directories are currently writable.{{/if}}
+  Git metadata directories needed by opened worktrees may also be writable, even when they live outside the project directories. Writes anywhere else on the filesystem are blocked.{{else}}. No project directories are currently writable.{{/if}}
 - Network: outbound network access is blocked.
 
 You can request elevated permissions on individual `terminal` calls by setting `allow_network: true`, `allow_fs_write: true`, or `unsandboxed: true`. The user will be prompted to approve before the command runs.

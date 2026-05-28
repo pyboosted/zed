@@ -31,9 +31,10 @@ use util::get_default_system_shell_preferring_bash;
 #[derive(Clone, Debug, Default)]
 pub struct SandboxWrap {
     /// Directory subtrees the sandbox should allow writes to. Pass the
-    /// project's worktree paths (and any per-command scratch directory)
-    /// here — *not* the command's working directory, which is model-
-    /// controlled and would let the model widen its own writable scope.
+    /// project's worktree paths, Git metadata directories required by those
+    /// worktrees, and any per-command scratch directory here — *not* the
+    /// command's working directory, which is model-controlled and would let
+    /// the model widen its own writable scope.
     pub writable_paths: Vec<PathBuf>,
     /// Allow outbound network access for this command.
     pub allow_network: bool,
