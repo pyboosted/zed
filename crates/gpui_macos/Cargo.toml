@@ -35,6 +35,7 @@ core-foundation-sys.workspace = true
 core-graphics.workspace = true
 core-text.workspace = true
 core-video.workspace = true
+io-surface = "0.16.1"
 ctor.workspace = true
 derive_more.workspace = true
 dispatch2 = "0.3.1"

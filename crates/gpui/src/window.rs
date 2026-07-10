@@ -13,18 +13,16 @@ use crate::{
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SurfaceBuffer,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, profiler, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -1940,14 +1938,74 @@ pub struct DispatchEventResult {
     pub default_prevented: bool,
 }
 
+/// The maximum number of rounded overflow clips retained in a content mask.
+pub const CONTENT_MASK_ROUNDED_CLIP_CAPACITY: usize = 4;
+
+/// A rounded clip entry inside a [`ContentMask`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct ContentMaskClip<P: Clone + Debug + Default + PartialEq> {
+    /// The clipped bounds.
+    pub bounds: Bounds<P>,
+    /// The corner radii applied to those bounds.
+    pub corner_radii: Corners<P>,
+}
+
+impl ContentMaskClip<Pixels> {
+    /// Scale this rounded clip to device pixels.
+    pub fn scale(&self, factor: f32) -> ContentMaskClip<ScaledPixels> {
+        ContentMaskClip {
+            bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
+        }
+    }
+}
+
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered. The aggregate `bounds` are used for coarse clipping and culling, while
+/// `rounded_clips` preserve rounded `overflow_hidden` ancestors for fragment-stage clipping.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// The number of rounded clip entries stored in `rounded_clips`.
+    pub rounded_clip_count: u32,
+    /// Rounded clip entries applied in ancestor order.
+    pub rounded_clips: [ContentMaskClip<P>; CONTENT_MASK_ROUNDED_CLIP_CAPACITY],
+}
+
+impl<P: Clone + Debug + Default + PartialEq> ContentMask<P> {
+    /// Construct a purely rectangular content mask.
+    pub fn from_bounds(bounds: Bounds<P>) -> Self {
+        Self {
+            bounds,
+            ..Default::default()
+        }
+    }
+
+    /// Append a rounded clip entry to this content mask.
+    pub fn with_rounded_clip(mut self, bounds: Bounds<P>, corner_radii: Corners<P>) -> Self {
+        self.push_rounded_clip(bounds, corner_radii);
+        self
+    }
+
+    fn push_rounded_clip(&mut self, bounds: Bounds<P>, corner_radii: Corners<P>) {
+        let index = self.rounded_clip_count as usize;
+        debug_assert!(
+            index < CONTENT_MASK_ROUNDED_CLIP_CAPACITY,
+            "content mask rounded clip capacity exceeded"
+        );
+        if index >= CONTENT_MASK_ROUNDED_CLIP_CAPACITY {
+            return;
+        }
+
+        self.rounded_clips[index] = ContentMaskClip {
+            bounds,
+            corner_radii,
+        };
+        self.rounded_clip_count += 1;
+    }
 }
 
 impl ContentMask<Pixels> {
@@ -1955,13 +2013,142 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            rounded_clip_count: self.rounded_clip_count,
+            rounded_clips: std::array::from_fn(|index| self.rounded_clips[index].scale(factor)),
         }
     }
 
     /// Intersect the content mask with the given content mask.
     pub fn intersect(&self, other: &Self) -> Self {
-        let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        let mut mask = ContentMask::from_bounds(self.bounds.intersect(&other.bounds));
+        let total_clips = self.rounded_clip_count as usize + other.rounded_clip_count as usize;
+        debug_assert!(
+            total_clips <= CONTENT_MASK_ROUNDED_CLIP_CAPACITY,
+            "content mask rounded clip capacity exceeded"
+        );
+
+        for clip in self
+            .rounded_clips
+            .iter()
+            .take(self.rounded_clip_count as usize)
+            .chain(
+                other
+                    .rounded_clips
+                    .iter()
+                    .take(other.rounded_clip_count as usize),
+            )
+        {
+            mask.push_rounded_clip(clip.bounds, clip.corner_radii);
+        }
+
+        mask
+    }
+}
+
+#[cfg(test)]
+mod content_mask_tests {
+    use super::*;
+    use crate::{TestAppContext, div};
+
+    struct EmptyView;
+
+    impl Render for EmptyView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[test]
+    fn invalidation_during_draw_stays_dirty_and_notifies() {
+        let mut cx = TestAppContext::single();
+        let notified = Rc::new(Cell::new(false));
+        let entity = cx.update(|cx| {
+            let entity = cx.new(|_| ());
+            cx.observe(&entity, {
+                let notified = notified.clone();
+                move |_, _| notified.set(true)
+            })
+            .detach();
+            entity
+        });
+
+        cx.update(|app| {
+            let invalidator = WindowInvalidator::new();
+            invalidator.set_dirty(false);
+            invalidator.set_phase(DrawPhase::Prepaint);
+
+            assert!(invalidator.invalidate_view(entity.entity_id(), app));
+            assert!(invalidator.is_dirty());
+        });
+
+        assert!(notified.get());
+    }
+
+    #[test]
+    fn transient_borrow_conflict_requeues_frame_callbacks_in_order() {
+        let mut cx = TestAppContext::single();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| EmptyView))
+                .unwrap()
+        });
+
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
+        for id in [1, 2] {
+            let order = order.clone();
+            callbacks.borrow_mut().push(Box::new(move |_, _| {
+                order.borrow_mut().push(id);
+            }));
+        }
+
+        let mut async_window_cx = AsyncWindowContext::new_context(cx.to_async(), window.any_handle);
+        cx.update(|_| {
+            flush_next_frame_callbacks(window.any_handle, &mut async_window_cx, &callbacks);
+        });
+
+        assert!(order.borrow().is_empty());
+        assert_eq!(callbacks.borrow().len(), 2);
+
+        let late_order = order.clone();
+        callbacks.borrow_mut().push(Box::new(move |_, _| {
+            late_order.borrow_mut().push(3);
+        }));
+
+        flush_next_frame_callbacks(window.any_handle, &mut async_window_cx, &callbacks);
+
+        assert_eq!(&*order.borrow(), &[1, 2, 3]);
+        assert!(callbacks.borrow().is_empty());
+    }
+
+    #[test]
+    fn intersection_preserves_the_rounded_clip_chain() {
+        let parent_bounds = Bounds::new(point(px(0.), px(0.)), size(px(120.), px(80.)));
+        let child_bounds = Bounds::new(point(px(12.), px(10.)), size(px(80.), px(50.)));
+        let parent = ContentMask::from_bounds(parent_bounds)
+            .with_rounded_clip(parent_bounds, Corners::from(px(12.)));
+        let child = ContentMask::from_bounds(child_bounds)
+            .with_rounded_clip(child_bounds, Corners::from(px(6.)));
+
+        let intersection = parent.intersect(&child);
+
+        assert_eq!(intersection.bounds, parent_bounds.intersect(&child_bounds));
+        assert_eq!(intersection.rounded_clip_count, 2);
+        assert_eq!(intersection.rounded_clips[0].bounds, parent_bounds);
+        assert_eq!(intersection.rounded_clips[1].bounds, child_bounds);
+    }
+
+    #[test]
+    fn scaling_preserves_rounded_clip_entries() {
+        let bounds = Bounds::new(point(px(4.), px(6.)), size(px(20.), px(12.)));
+        let mask =
+            ContentMask::from_bounds(bounds).with_rounded_clip(bounds, Corners::from(px(5.)));
+
+        let scaled = mask.scale(2.0);
+
+        assert_eq!(scaled.bounds, bounds.scale(2.0));
+        assert_eq!(scaled.rounded_clip_count, 1);
+        assert_eq!(scaled.rounded_clips[0].bounds, bounds.scale(2.0));
+        assert_eq!(scaled.rounded_clips[0].corner_radii.top_left.0, 10.0);
     }
 }
 
@@ -2757,9 +2944,10 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
-        ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
-        }
+        let content_mask = self.content_mask();
+        let mut snapped = content_mask.scale(self.scale_factor());
+        snapped.bounds = self.cover_bounds(content_mask.bounds);
+        snapped
     }
 
     /// Call to prevent the default action of an event. Currently only used to prevent
@@ -3653,15 +3841,12 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
-        self.content_mask_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| ContentMask {
-                bounds: Bounds {
-                    origin: Point::default(),
-                    size: self.viewport_size,
-                },
+        self.content_mask_stack.last().cloned().unwrap_or_else(|| {
+            ContentMask::from_bounds(Bounds {
+                origin: Point::default(),
+                size: self.viewport_size,
             })
+        })
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
@@ -4073,6 +4258,7 @@ impl Window {
                 self.next_frame.scene.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
+                        ..quad.content_mask
                     },
                     ..quad
                 });
@@ -4446,8 +4632,8 @@ impl Window {
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: SurfaceBuffer) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();

@@ -675,7 +675,19 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                Some(ContentMask { bounds })
+                let corner_radii = self
+                    .corner_radii
+                    .to_pixels(rem_size)
+                    .clamp_radii_for_quad_size(bounds.size);
+                let mut content_mask = ContentMask::from_bounds(bounds);
+                if self.overflow.x != Overflow::Visible
+                    && self.overflow.y != Overflow::Visible
+                    && corner_radii.max() > Pixels::ZERO
+                {
+                    content_mask = content_mask.with_rounded_clip(bounds, corner_radii);
+                }
+
+                Some(content_mask)
             }
         }
     }

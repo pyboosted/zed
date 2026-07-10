@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use itertools::Itertools;
+use std::sync::OnceLock;
 use windows::Win32::{
     Foundation::HMODULE,
     Graphics::{
@@ -15,11 +16,18 @@ use windows::Win32::{
         },
         Dxgi::{
             CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IDXGIAdapter1, IDXGIFactory6,
         },
     },
 };
 use windows::core::Interface;
+
+static RENDER_ADAPTER_LUID: OnceLock<i64> = OnceLock::new();
+
+/// Returns the DXGI LUID of the adapter selected by GPUI's renderer.
+pub fn render_adapter_luid() -> Option<i64> {
+    RENDER_ADAPTER_LUID.get().copied()
+}
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     (0..5)
@@ -112,31 +120,67 @@ fn get_adapter(
     ID3D11DeviceContext,
     D3D_FEATURE_LEVEL,
 )> {
+    // Chromium/ANGLE prefers the high-performance adapter. Matching that
+    // selection is required for accelerated OSR textures to be shareable on
+    // hybrid-GPU systems.
+    for adapter_index in 0.. {
+        let adapter: IDXGIAdapter1 = match unsafe {
+            dxgi_factory
+                .EnumAdapterByGpuPreference(adapter_index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+        } {
+            Ok(adapter) => adapter,
+            Err(_) => break,
+        };
+        if let Some(result) = try_create_adapter(adapter, debug_layer_available) {
+            return Ok(result);
+        }
+    }
+
+    // Older systems or drivers can reject preference enumeration. Preserve
+    // GPUI's original enumeration as a fallback.
     for adapter_index in 0.. {
         let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
-            let gpu_name = String::from_utf16_lossy(&desc.Description)
-                .trim_matches(char::from(0))
-                .to_string();
-            log::info!("Using GPU: {}", gpu_name);
-        }
-        // Check to see whether the adapter supports Direct3D 11 and create
-        // the device if it does.
-        let mut context: Option<ID3D11DeviceContext> = None;
-        let mut feature_level = D3D_FEATURE_LEVEL::default();
-        if let Some(device) = get_device(
-            &adapter,
-            Some(&mut context),
-            Some(&mut feature_level),
-            debug_layer_available,
-        )
-        .log_err()
-        {
-            return Ok((adapter, device, context.unwrap(), feature_level));
+        if let Some(result) = try_create_adapter(adapter, debug_layer_available) {
+            return Ok(result);
         }
     }
 
     unreachable!()
+}
+
+fn try_create_adapter(
+    adapter: IDXGIAdapter1,
+    debug_layer_available: bool,
+) -> Option<(
+    IDXGIAdapter1,
+    ID3D11Device,
+    ID3D11DeviceContext,
+    D3D_FEATURE_LEVEL,
+)> {
+    let desc = unsafe { adapter.GetDesc1() }.ok();
+    if let Some(desc) = &desc {
+        let gpu_name = String::from_utf16_lossy(&desc.Description)
+            .trim_matches(char::from(0))
+            .to_string();
+        log::info!("Trying GPU: {}", gpu_name);
+    }
+
+    let mut context: Option<ID3D11DeviceContext> = None;
+    let mut feature_level = D3D_FEATURE_LEVEL::default();
+    let device = get_device(
+        &adapter,
+        Some(&mut context),
+        Some(&mut feature_level),
+        debug_layer_available,
+    )
+    .log_err()?;
+
+    if let Some(desc) = desc {
+        let luid = ((desc.AdapterLuid.HighPart as i64) << 32) | i64::from(desc.AdapterLuid.LowPart);
+        let _ = RENDER_ADAPTER_LUID.set(luid);
+    }
+
+    Some((adapter, device, context?, feature_level))
 }
 
 #[inline]

@@ -27,6 +27,9 @@ float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
+float rounded_clip_alpha(float2 position, Bounds_ScaledPixels bounds,
+                         Corners_ScaledPixels corner_radii);
+float content_mask_alpha(float2 position, ContentMask_ScaledPixels content_mask);
 float quad_sdf_impl(float2 center_to_point, float corner_radius);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
@@ -101,6 +104,10 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]]) {
   Quad quad = quads[input.quad_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, quad.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
@@ -115,6 +122,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
+    background_color.a *= clip_alpha;
     return background_color;
   }
 
@@ -175,6 +183,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
+    background_color.a *= clip_alpha;
     return background_color;
   }
 
@@ -393,7 +402,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
-  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+  color.a *= saturate(antialias_threshold - outer_sdf) * clip_alpha;
+  return color;
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -498,6 +508,10 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 constant Shadow *shadows
                                 [[buffer(ShadowInputIndex_Shadows)]]) {
   Shadow shadow = shadows[input.shadow_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, shadow.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
   float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
@@ -551,7 +565,9 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha *= saturate(0.5 - element_distance);
   }
 
-  return input.color * float4(1., 1., 1., alpha);
+  float4 color = input.color;
+  color.a *= alpha * clip_alpha;
+  return color;
 }
 
 struct UnderlineVertexOutput {
@@ -594,6 +610,10 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_HEIGHT_RATIO = 0.8;
 
   Underline underline = underlines[input.underline_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, underline.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
@@ -612,9 +632,13 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    float4 color = input.color;
+    color.a *= alpha * clip_alpha;
+    return color;
   } else {
-    return input.color;
+    float4 color = input.color;
+    color.a *= clip_alpha;
+    return color;
   }
 }
 
@@ -622,6 +646,7 @@ struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  uint sprite_id [[flat]];
   float4 clip_distance;
 };
 
@@ -629,6 +654,7 @@ struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  uint sprite_id [[flat]];
   float4 clip_distance;
 };
 
@@ -652,6 +678,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       device_position,
       tile_position,
       color,
+      sprite_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -662,13 +689,18 @@ fragment float4 monochrome_sprite_fragment(
   if (any(input.clip_distance < float4(0.0))) {
     return float4(0.0);
   }
+  MonochromeSprite sprite = sprites[input.sprite_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
 
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
-  color.a *= sample.a;
+  color.a *= sample.a * clip_alpha;
   return color;
 }
 
@@ -713,6 +745,10 @@ fragment float4 polychrome_sprite_fragment(
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
   PolychromeSprite sprite = sprites[input.sprite_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, sprite.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
   float4 sample =
@@ -727,7 +763,7 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance);
+  color.a *= sprite.opacity * saturate(0.5 - distance) * clip_alpha;
   return color;
 }
 
@@ -777,6 +813,10 @@ fragment float4 path_rasterization_fragment(
   float2 dy = dfdy(input.st_position);
 
   PathRasterizationVertex v = vertices[input.vertex_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, v.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
   Background background = v.color;
   Bounds_ScaledPixels path_bounds = v.bounds;
   float alpha;
@@ -808,7 +848,10 @@ fragment float4 path_rasterization_fragment(
     gradient_color.color0,
     gradient_color.color1
   );
-  return float4(color.rgb * color.a * alpha, alpha * color.a);
+  return float4(
+    color.rgb * color.a * alpha * clip_alpha,
+    alpha * color.a * clip_alpha
+  );
 }
 
 struct PathSpriteVertexOutput {
@@ -850,12 +893,14 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -878,14 +923,22 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      surface_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                 constant SurfaceBounds *surfaces
+                                 [[buffer(SurfaceInputIndex_Surfaces)]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
                                  [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+  SurfaceBounds surface = surfaces[input.surface_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, surface.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
@@ -896,7 +949,24 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  color.a *= clip_alpha;
+  return color;
+}
+
+fragment float4 surface_fragment_bgra(
+    SurfaceFragmentInput input [[stage_in]],
+    constant SurfaceBounds *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
+    texture2d<float> bgra_texture [[texture(SurfaceInputIndex_YTexture)]]) {
+  SurfaceBounds surface = surfaces[input.surface_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, surface.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float4 color = bgra_texture.sample(texture_sampler, input.texture_position);
+  color.a *= clip_alpha;
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1069,6 +1139,24 @@ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
     float2 corner_to_point = fabs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
     return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+float rounded_clip_alpha(float2 position, Bounds_ScaledPixels bounds,
+                         Corners_ScaledPixels corner_radii) {
+  return saturate(0.5 - quad_sdf(position, bounds, corner_radii));
+}
+
+float content_mask_alpha(float2 position, ContentMask_ScaledPixels content_mask) {
+  float alpha = 1.0;
+  for (uint clip_index = 0; clip_index < content_mask.rounded_clip_count; clip_index++) {
+    ContentMaskClip_ScaledPixels clip = content_mask.rounded_clips[clip_index];
+    alpha = min(alpha, rounded_clip_alpha(position, clip.bounds, clip.corner_radii));
+    if (alpha <= 0.0) {
+      return 0.0;
+    }
+  }
+
+  return alpha;
 }
 
 // Implementation of quad signed distance field

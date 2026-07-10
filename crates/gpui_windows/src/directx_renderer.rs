@@ -55,6 +55,101 @@ pub(crate) struct DirectXRenderer {
     skip_draws: bool,
 }
 
+struct CaptureDevice {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+}
+
+// SAFETY: GPUI creates its D3D11 device without D3D11_CREATE_DEVICE_SINGLETHREADED.
+unsafe impl Send for CaptureDevice {}
+unsafe impl Sync for CaptureDevice {}
+
+static CAPTURE_DEVICE: std::sync::RwLock<Option<CaptureDevice>> = std::sync::RwLock::new(None);
+
+fn set_capture_device(device: &ID3D11Device, context: &ID3D11DeviceContext) {
+    // CEF paint callbacks are not guaranteed to run on GPUI's render thread.
+    // Protect the shared immediate context before publishing it cross-thread.
+    if let Ok(multithread) = context.cast::<ID3D11Multithread>() {
+        let _ = unsafe { multithread.SetMultithreadProtected(true) };
+    }
+    if let Ok(mut capture_device) = CAPTURE_DEVICE.write() {
+        *capture_device = Some(CaptureDevice {
+            device: device.clone(),
+            context: context.clone(),
+        });
+    }
+}
+
+struct WindowsSurface {
+    _texture: ID3D11Texture2D,
+    srv: ID3D11ShaderResourceView,
+}
+
+// SAFETY: these resources belong to GPUI's free-threaded D3D11 device.
+unsafe impl Send for WindowsSurface {}
+unsafe impl Sync for WindowsSurface {}
+
+/// Copy a transient shared D3D11 texture into storage owned by GPUI.
+///
+/// This must run synchronously while the producer's NT handle is valid. The
+/// private copy prevents a producer such as CEF from recycling the texture
+/// before GPUI renders the next frame.
+pub fn capture_shared_texture(
+    handle: isize,
+    width: u32,
+    height: u32,
+    generation: u64,
+) -> Option<SurfaceBuffer> {
+    if handle == 0 || width == 0 || height == 0 {
+        return None;
+    }
+
+    let capture_device = CAPTURE_DEVICE.read().ok()?;
+    let capture_device = capture_device.as_ref()?;
+    let device: ID3D11Device1 = capture_device.device.cast().log_err()?;
+    let shared: ID3D11Texture2D =
+        unsafe { device.OpenSharedResource1(windows::Win32::Foundation::HANDLE(handle as *mut _)) }
+            .log_err()?;
+
+    let mut descriptor = D3D11_TEXTURE2D_DESC::default();
+    unsafe { shared.GetDesc(&mut descriptor) };
+    descriptor.Usage = D3D11_USAGE_DEFAULT;
+    descriptor.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+    descriptor.CPUAccessFlags = 0;
+    descriptor.MiscFlags = 0;
+
+    let mut texture = None;
+    unsafe {
+        capture_device
+            .device
+            .CreateTexture2D(&descriptor, None, Some(&mut texture))
+    }
+    .log_err()?;
+    let texture = texture?;
+    unsafe { capture_device.context.CopyResource(&texture, &shared) };
+
+    let mut srv = None;
+    unsafe {
+        capture_device
+            .device
+            .CreateShaderResourceView(&texture, None, Some(&mut srv))
+    }
+    .log_err()?;
+
+    let surface = SurfaceBuffer::from_platform_surface(
+        WindowsSurface {
+            _texture: texture,
+            srv: srv?,
+        },
+        width,
+        height,
+        None,
+        None,
+    );
+    surface.set_generation(generation);
+    Some(surface)
+}
+
 /// Direct3D objects
 #[derive(Clone)]
 pub(crate) struct DirectXRendererDevices {
@@ -91,6 +186,7 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    surface_sprites: PipelineState<PolychromeSprite>,
 }
 
 struct DirectXGlobalElements {
@@ -180,6 +276,7 @@ impl DirectXRenderer {
             Some(composition)
         };
 
+        set_capture_device(&devices.device, &devices.device_context);
         Ok(DirectXRenderer {
             hwnd,
             atlas,
@@ -316,6 +413,9 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
+        if let Some(devices) = &self.devices {
+            set_capture_device(&devices.device, &devices.device_context);
+        }
         Ok(())
     }
 
@@ -729,6 +829,57 @@ impl DirectXRenderer {
         if surfaces.is_empty() {
             return Ok(());
         }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        for surface in surfaces {
+            let Some(platform_surface) = surface.image_buffer.platform_surface::<WindowsSurface>()
+            else {
+                continue;
+            };
+            let width = surface.image_buffer.get_width();
+            let height = surface.image_buffer.get_height();
+            if width == 0 || height == 0 {
+                continue;
+            }
+
+            let sprite = PolychromeSprite {
+                order: surface.order,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.0,
+                bounds: surface.bounds,
+                content_mask: surface.content_mask,
+                corner_radii: Corners::default(),
+                tile: AtlasTile {
+                    texture_id: AtlasTextureId {
+                        index: 0,
+                        kind: AtlasTextureKind::Polychrome,
+                    },
+                    tile_id: TileId(0),
+                    padding: 0,
+                    bounds: Bounds {
+                        origin: point(DevicePixels(0), DevicePixels(0)),
+                        size: size(DevicePixels(width as i32), DevicePixels(height as i32)),
+                    },
+                },
+            };
+            self.pipelines.surface_sprites.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &[sprite],
+            )?;
+            let srv = [Some(platform_surface.srv.clone())];
+            self.pipelines.surface_sprites.draw_range_with_texture(
+                &devices.device,
+                &devices.device_context,
+                &srv,
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                0,
+                1,
+            )?;
+        }
         Ok(())
     }
 
@@ -909,6 +1060,16 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        // Surface sprites have their own instance buffer. Scene sprite buffers
+        // are uploaded once before batch traversal, so reusing `poly_sprites`
+        // here would corrupt any polychrome batch that follows a surface.
+        let surface_sprites = PipelineState::new(
+            device,
+            "surface_sprite_pipeline",
+            ShaderModule::PolychromeSprite,
+            4,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -919,6 +1080,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            surface_sprites,
         })
     }
 }

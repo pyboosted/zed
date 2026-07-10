@@ -27,6 +27,7 @@ mod open_type;
 mod text_system;
 
 mod platform;
+mod surface;
 mod window;
 mod window_appearance;
 
@@ -46,12 +47,14 @@ pub(crate) use display::*;
 pub(crate) use display_link::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
+pub(crate) use surface::MacSurface;
 pub(crate) use window::*;
 
 #[cfg(feature = "font-kit")]
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
+pub use surface::{surface_buffer, surface_buffer_from_io_surface};
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

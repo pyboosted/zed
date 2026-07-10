@@ -7944,6 +7944,7 @@ dependencies = [
  "gpui",
  "gpui_util",
  "image",
+ "io-surface",
  "itertools 0.14.0",
  "libc",
  "log",

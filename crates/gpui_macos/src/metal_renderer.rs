@@ -1,4 +1,4 @@
-use crate::metal_atlas::MetalAtlas;
+use crate::{MacSurface, metal_atlas::MetalAtlas};
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -16,18 +16,32 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    },
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
-    RenderPassColorAttachmentDescriptorRef,
+    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, MTLStorageMode,
+    MTLTextureType, MTLTextureUsage, NSRange, RenderPassColorAttachmentDescriptorRef,
+    TextureDescriptor,
 };
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::{HashMap, VecDeque},
+    ffi::c_void,
+    mem, ptr,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -39,9 +53,51 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+const SURFACE_SOURCE_TEXTURE_RETENTION_FRAMES: usize = 3;
+const ENJOY_CEF_REDRAW_DEBUG_ENV: &str = "ENJOY_CEF_REDRAW_DEBUG";
+
+static LOGGED_SURFACE_BLIT_FAILURE: AtomicBool = AtomicBool::new(false);
+static LOGGED_DIRECT_IOSURFACE_IMPORT: AtomicBool = AtomicBool::new(false);
+static LOGGED_DIRECT_IOSURFACE_IMPORT_FAILURE: AtomicBool = AtomicBool::new(false);
+static LOGGED_CVMETALTEXTURE_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+fn cef_redraw_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Some(value) = std::env::var_os(ENJOY_CEF_REDRAW_DEBUG_ENV) else {
+            return false;
+        };
+        let value = value.to_string_lossy();
+        let value = value.trim();
+        !value.is_empty()
+            && !value.eq_ignore_ascii_case("0")
+            && !value.eq_ignore_ascii_case("false")
+            && !value.eq_ignore_ascii_case("no")
+            && !value.eq_ignore_ascii_case("off")
+    })
+}
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedSurfaceStorage {
+    DirectImport,
+    RetainedCopy,
+}
+
+struct CachedSurfaceTexture {
+    texture: metal::Texture,
+    retained_cv_textures: VecDeque<core_video::metal_texture::CVMetalTexture>,
+    retained_surfaces: VecDeque<gpui::SurfaceBuffer>,
+    source_surface_id: Option<u64>,
+    storage: CachedSurfaceStorage,
+    generation: u64,
+    width: usize,
+    height: usize,
+    pixel_format: u32,
+    last_frame_used: u64,
+}
 
 pub(crate) unsafe fn new_renderer(
     context: self::Context,
@@ -125,11 +181,14 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    surfaces_bgra_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    surface_texture_cache: HashMap<usize, CachedSurfaceTexture>,
+    frame_counter: u64,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -322,6 +381,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let surfaces_bgra_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces_bgra",
+            "surface_vertex",
+            "surface_fragment_bgra",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -344,10 +411,13 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_bgra_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            surface_texture_cache: HashMap::new(),
+            frame_counter: 0,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -832,6 +902,7 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        self.frame_counter = self.frame_counter.wrapping_add(1);
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
@@ -921,13 +992,26 @@ impl MetalRenderer {
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
-                    &scene.surfaces[range],
-                    instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
-                    command_encoder,
-                ),
+                PrimitiveBatch::Surfaces(range) => {
+                    let surfaces = &scene.surfaces[range];
+                    command_encoder.end_encoding();
+                    self.prepare_surface_textures(surfaces, command_buffer);
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        |color_attachment| {
+                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                        },
+                    );
+                    self.draw_surfaces(
+                        surfaces,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    )
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             };
             if !ok {
@@ -946,6 +1030,7 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
+        self.prune_surface_texture_cache();
 
         if !self.is_unified_memory {
             // Sync the instance buffer to the GPU
@@ -956,6 +1041,366 @@ impl MetalRenderer {
         }
 
         Ok(command_buffer.to_owned())
+    }
+
+    fn prune_surface_texture_cache(&mut self) {
+        let frame_counter = self.frame_counter;
+        self.surface_texture_cache
+            .retain(|_, entry| frame_counter.saturating_sub(entry.last_frame_used) <= 8);
+    }
+
+    fn prepare_surface_textures(
+        &mut self,
+        surfaces: &[PaintSurface],
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        for surface in surfaces {
+            let Some(native_surface) = surface.image_buffer.platform_surface::<MacSurface>() else {
+                continue;
+            };
+            let pixel_buffer = native_surface.pixel_buffer();
+            let pixel_format = pixel_buffer.get_pixel_format();
+            if pixel_format != kCVPixelFormatType_32BGRA
+                && pixel_format != kCVPixelFormatType_32RGBA
+            {
+                continue;
+            }
+
+            let cache_key = surface.image_buffer.cache_key();
+            let generation = surface.image_buffer.generation();
+            let width = pixel_buffer.get_width();
+            let height = pixel_buffer.get_height();
+            let source_surface_id = surface.image_buffer.source_surface_id();
+            let prefer_retained_copy = surface.image_buffer.prefer_retained_copy();
+            let metal_pixel_format = if pixel_format == kCVPixelFormatType_32RGBA {
+                MTLPixelFormat::RGBA8Unorm
+            } else {
+                MTLPixelFormat::BGRA8Unorm
+            };
+            let cached_entry = self.surface_texture_cache.get(&cache_key).map(|entry| {
+                (
+                    entry.storage,
+                    entry.source_surface_id,
+                    entry.generation,
+                    entry.width,
+                    entry.height,
+                    entry.pixel_format,
+                    entry.texture.clone(),
+                )
+            });
+
+            if let Some((
+                storage,
+                cached_source_surface_id,
+                cached_generation,
+                cached_width,
+                cached_height,
+                cached_pixel_format,
+                cached_texture,
+            )) = cached_entry
+            {
+                let descriptor_matches = cached_width == width
+                    && cached_height == height
+                    && cached_pixel_format == pixel_format;
+
+                if descriptor_matches
+                    && storage == CachedSurfaceStorage::DirectImport
+                    && !prefer_retained_copy
+                    && source_surface_id.is_some()
+                    && cached_source_surface_id == source_surface_id
+                {
+                    if cached_generation != generation {
+                        if let Some(texture) = self.import_io_surface_texture(
+                            native_surface,
+                            metal_pixel_format,
+                            width,
+                            height,
+                        ) {
+                            if let Some(entry) = self.surface_texture_cache.get_mut(&cache_key) {
+                                entry.texture = texture;
+                                entry.last_frame_used = self.frame_counter;
+                                entry.generation = generation;
+                                entry
+                                    .retained_surfaces
+                                    .push_back(surface.image_buffer.clone());
+                                while entry.retained_surfaces.len()
+                                    > SURFACE_SOURCE_TEXTURE_RETENTION_FRAMES
+                                {
+                                    entry.retained_surfaces.pop_front();
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    if cached_generation == generation {
+                        if let Some(entry) = self.surface_texture_cache.get_mut(&cache_key) {
+                            entry.last_frame_used = self.frame_counter;
+                            entry
+                                .retained_surfaces
+                                .push_back(surface.image_buffer.clone());
+                            while entry.retained_surfaces.len()
+                                > SURFACE_SOURCE_TEXTURE_RETENTION_FRAMES
+                            {
+                                entry.retained_surfaces.pop_front();
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                if descriptor_matches
+                    && storage == CachedSurfaceStorage::RetainedCopy
+                    && cached_generation == generation
+                    && cached_source_surface_id == source_surface_id
+                {
+                    if let Some(entry) = self.surface_texture_cache.get_mut(&cache_key) {
+                        entry.last_frame_used = self.frame_counter;
+                    }
+                    continue;
+                }
+
+                if descriptor_matches && storage == CachedSurfaceStorage::RetainedCopy {
+                    let skipped_generation = generation != cached_generation.saturating_add(1);
+                    let Some((source_texture, source_cv_texture)) = self
+                        .create_cv_metal_source_texture(
+                            native_surface,
+                            metal_pixel_format,
+                            width,
+                            height,
+                            pixel_format,
+                        )
+                    else {
+                        continue;
+                    };
+
+                    self.blit_surface_regions(
+                        command_buffer,
+                        &source_texture,
+                        &cached_texture,
+                        surface,
+                        width,
+                        height,
+                        cached_source_surface_id != source_surface_id || skipped_generation,
+                    );
+
+                    if let Some(entry) = self.surface_texture_cache.get_mut(&cache_key) {
+                        entry.last_frame_used = self.frame_counter;
+                        entry.retained_cv_textures.push_back(source_cv_texture);
+                        while entry.retained_cv_textures.len()
+                            > SURFACE_SOURCE_TEXTURE_RETENTION_FRAMES
+                        {
+                            entry.retained_cv_textures.pop_front();
+                        }
+                        entry.generation = generation;
+                        entry.source_surface_id = source_surface_id;
+                    }
+                    continue;
+                }
+            }
+
+            if !prefer_retained_copy {
+                if let Some(texture) = self.import_io_surface_texture(
+                    native_surface,
+                    metal_pixel_format,
+                    width,
+                    height,
+                ) {
+                    if !LOGGED_DIRECT_IOSURFACE_IMPORT.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "gpui: using direct IOSurface -> MTLTexture import for BGRA surfaces"
+                        );
+                    }
+                    self.surface_texture_cache.insert(
+                        cache_key,
+                        CachedSurfaceTexture {
+                            texture,
+                            retained_cv_textures: VecDeque::new(),
+                            retained_surfaces: VecDeque::from([surface.image_buffer.clone()]),
+                            source_surface_id,
+                            storage: CachedSurfaceStorage::DirectImport,
+                            generation,
+                            width,
+                            height,
+                            pixel_format,
+                            last_frame_used: self.frame_counter,
+                        },
+                    );
+                    continue;
+                }
+            }
+
+            let Some((source_texture, source_cv_texture)) = self.create_cv_metal_source_texture(
+                native_surface,
+                metal_pixel_format,
+                width,
+                height,
+                pixel_format,
+            ) else {
+                continue;
+            };
+
+            let texture = self.create_surface_copy_texture(metal_pixel_format, width, height);
+            self.blit_surface_regions(
+                command_buffer,
+                &source_texture,
+                &texture,
+                surface,
+                width,
+                height,
+                true,
+            );
+
+            let mut retained_cv_textures = VecDeque::new();
+            retained_cv_textures.push_back(source_cv_texture);
+            self.surface_texture_cache.insert(
+                cache_key,
+                CachedSurfaceTexture {
+                    texture,
+                    retained_cv_textures,
+                    retained_surfaces: VecDeque::new(),
+                    source_surface_id,
+                    storage: CachedSurfaceStorage::RetainedCopy,
+                    generation,
+                    width,
+                    height,
+                    pixel_format,
+                    last_frame_used: self.frame_counter,
+                },
+            );
+        }
+    }
+
+    fn create_surface_copy_texture(
+        &self,
+        pixel_format: MTLPixelFormat,
+        width: usize,
+        height: usize,
+    ) -> metal::Texture {
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_pixel_format(pixel_format);
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_storage_mode(MTLStorageMode::Private);
+        descriptor.set_usage(MTLTextureUsage::ShaderRead);
+        self.device.new_texture(&descriptor)
+    }
+
+    fn create_cv_metal_source_texture(
+        &self,
+        surface: &MacSurface,
+        metal_pixel_format: MTLPixelFormat,
+        width: usize,
+        height: usize,
+        pixel_format: u32,
+    ) -> Option<(metal::Texture, core_video::metal_texture::CVMetalTexture)> {
+        if !LOGGED_CVMETALTEXTURE_FALLBACK.swap(true, Ordering::Relaxed) {
+            eprintln!("gpui: falling back to CVMetalTextureCache for BGRA surfaces");
+        }
+        let source_texture = match self.core_video_texture_cache.create_texture_from_image(
+            surface.pixel_buffer().as_concrete_TypeRef(),
+            None,
+            metal_pixel_format,
+            width,
+            height,
+            0,
+        ) {
+            Ok(texture) => texture,
+            Err(status) => {
+                if !LOGGED_SURFACE_BLIT_FAILURE.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "gpui: failed to import BGRA surface for retained copy status={status:?} size={}x{} format={pixel_format}",
+                        width, height
+                    );
+                }
+                return None;
+            }
+        };
+        let texture_ref = unsafe {
+            let texture_ref = CVMetalTextureGetTexture(source_texture.as_concrete_TypeRef());
+            (!texture_ref.is_null()).then(|| metal::TextureRef::from_ptr(texture_ref as *mut _))
+        }?;
+        Some((texture_ref.to_owned(), source_texture))
+    }
+
+    fn blit_surface_regions(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        source_texture: &metal::TextureRef,
+        destination_texture: &metal::TextureRef,
+        surface: &PaintSurface,
+        width: usize,
+        height: usize,
+        force_full_copy: bool,
+    ) {
+        let rects = surface_copy_rects(surface, width, height, force_full_copy);
+        let blit_encoder = command_buffer.new_blit_command_encoder();
+        for rect in rects {
+            blit_encoder.copy_from_texture(
+                source_texture,
+                0,
+                0,
+                metal::MTLOrigin {
+                    x: rect.x as u64,
+                    y: rect.y as u64,
+                    z: 0,
+                },
+                metal::MTLSize {
+                    width: rect.width as u64,
+                    height: rect.height as u64,
+                    depth: 1,
+                },
+                destination_texture,
+                0,
+                0,
+                metal::MTLOrigin {
+                    x: rect.x as u64,
+                    y: rect.y as u64,
+                    z: 0,
+                },
+            );
+        }
+        blit_encoder.end_encoding();
+    }
+
+    fn import_io_surface_texture(
+        &self,
+        surface: &MacSurface,
+        pixel_format: MTLPixelFormat,
+        width: usize,
+        height: usize,
+    ) -> Option<metal::Texture> {
+        surface.io_surface_ref().and_then(|io_surface_ref| {
+            let descriptor = TextureDescriptor::new();
+            descriptor.set_texture_type(MTLTextureType::D2);
+            descriptor.set_pixel_format(pixel_format);
+            descriptor.set_width(width as u64);
+            descriptor.set_height(height as u64);
+            descriptor.set_usage(MTLTextureUsage::ShaderRead);
+
+            let ptr: *mut metal::MTLTexture = unsafe {
+                msg_send![
+                    &*self.device,
+                    newTextureWithDescriptor:&*descriptor
+                    iosurface:io_surface_ref
+                    plane:0usize
+                ]
+            };
+            if ptr.is_null() {
+                if cef_redraw_debug_enabled()
+                    && !LOGGED_DIRECT_IOSURFACE_IMPORT_FAILURE.swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "gpui: direct IOSurface import returned null texture size={}x{} format={:?}",
+                        width, height, pixel_format
+                    );
+                }
+                None
+            } else {
+                Some(unsafe { metal::Texture::from_ptr(ptr) })
+            }
+        })
     }
 
     fn draw_paths_to_intermediate(
@@ -1475,7 +1920,16 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+        enum SurfaceTextures {
+            YCbCr {
+                y: core_video::metal_texture::CVMetalTexture,
+                cbcr: core_video::metal_texture::CVMetalTexture,
+            },
+            Rgba {
+                texture: metal::Texture,
+            },
+        }
+
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1488,38 +1942,59 @@ impl MetalRenderer {
         );
 
         for surface in surfaces {
+            let Some(native_surface) = surface.image_buffer.platform_surface::<MacSurface>() else {
+                continue;
+            };
+            let pixel_buffer = native_surface.pixel_buffer();
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(pixel_buffer.get_width() as i32),
+                DevicePixels::from(pixel_buffer.get_height() as i32),
             );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+            let pixel_format = pixel_buffer.get_pixel_format();
+            let textures = if pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                let Ok(y_texture) = self.core_video_texture_cache.create_texture_from_image(
+                    pixel_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
+                    pixel_buffer.get_width_of_plane(0),
+                    pixel_buffer.get_height_of_plane(0),
                     0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                ) else {
+                    continue;
+                };
+                let Ok(cb_cr_texture) = self.core_video_texture_cache.create_texture_from_image(
+                    pixel_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
+                    pixel_buffer.get_width_of_plane(1),
+                    pixel_buffer.get_height_of_plane(1),
                     1,
-                )
-                .unwrap();
+                ) else {
+                    continue;
+                };
+                SurfaceTextures::YCbCr {
+                    y: y_texture,
+                    cbcr: cb_cr_texture,
+                }
+            } else if pixel_format == kCVPixelFormatType_32BGRA
+                || pixel_format == kCVPixelFormatType_32RGBA
+            {
+                command_encoder.set_render_pipeline_state(&self.surfaces_bgra_pipeline_state);
+                let Some(entry) = self
+                    .surface_texture_cache
+                    .get_mut(&surface.image_buffer.cache_key())
+                else {
+                    continue;
+                };
+                entry.last_frame_used = self.frame_counter;
+                SurfaceTextures::Rgba {
+                    texture: entry.texture.clone(),
+                }
+            } else {
+                continue;
+            };
 
             align_offset(instance_offset);
             let next_offset = *instance_offset + mem::size_of::<Surface>();
@@ -1532,20 +2007,37 @@ impl MetalRenderer {
                 Some(&instance_buffer.metal_buffer),
                 *instance_offset as u64,
             );
+            command_encoder.set_fragment_buffer(
+                SurfaceInputIndex::Surfaces as u64,
+                Some(&instance_buffer.metal_buffer),
+                *instance_offset as u64,
+            );
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
+            match &textures {
+                SurfaceTextures::YCbCr { y, cbcr } => {
+                    let y = unsafe {
+                        let texture = CVMetalTextureGetTexture(y.as_concrete_TypeRef());
+                        (!texture.is_null()).then(|| metal::TextureRef::from_ptr(texture as *mut _))
+                    };
+                    let cbcr = unsafe {
+                        let texture = CVMetalTextureGetTexture(cbcr.as_concrete_TypeRef());
+                        (!texture.is_null()).then(|| metal::TextureRef::from_ptr(texture as *mut _))
+                    };
+                    command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, y);
+                    command_encoder
+                        .set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, cbcr);
+                }
+                SurfaceTextures::Rgba { texture } => {
+                    command_encoder
+                        .set_fragment_texture(SurfaceInputIndex::YTexture as u64, Some(texture));
+                    command_encoder
+                        .set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, None);
+                }
+            }
 
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
@@ -1564,6 +2056,61 @@ impl MetalRenderer {
             *instance_offset = next_offset;
         }
         true
+    }
+}
+
+fn surface_copy_rects(
+    surface: &PaintSurface,
+    width: usize,
+    height: usize,
+    force_full_copy: bool,
+) -> Vec<gpui::SurfaceDamageRect> {
+    if force_full_copy {
+        return vec![gpui::SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }];
+    }
+
+    let rects = surface.image_buffer.dirty_rects();
+    if rects.is_empty() {
+        return vec![gpui::SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }];
+    }
+
+    let rects = rects
+        .into_iter()
+        .filter_map(|rect| {
+            let x = rect.x.min(width);
+            let y = rect.y.min(height);
+            let max_width = width.saturating_sub(x);
+            let max_height = height.saturating_sub(y);
+            let width = rect.width.min(max_width);
+            let height = rect.height.min(max_height);
+            (width > 0 && height > 0).then_some(gpui::SurfaceDamageRect {
+                x,
+                y,
+                width,
+                height,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if rects.is_empty() {
+        vec![gpui::SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }]
+    } else {
+        rects
     }
 }
 
