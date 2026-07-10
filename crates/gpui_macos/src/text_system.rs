@@ -617,10 +617,15 @@ impl MacTextSystemState {
             }
         }
         let typographic_bounds = line.get_typographic_bounds();
+        // CoreText's typographic bounds omit trailing whitespace. The terminal
+        // relies on the full advance width for cell placement and screenshots.
+        let string_range = line.get_string_range();
+        let end_offset =
+            line.get_string_offset_for_string_index(string_range.location + string_range.length);
         LineLayout {
             runs,
             font_size,
-            width: typographic_bounds.width.into(),
+            width: typographic_bounds.width.max(end_offset as f64).into(),
             ascent: max_ascent.into(),
             descent: max_descent.into(),
             len: text.len(),
@@ -900,5 +905,28 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_layout_line_trailing_spaces_expand_width() {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+
+        let layout = |text: &'static str| {
+            fonts.layout_line(
+                text,
+                px(16.),
+                &[FontRun {
+                    font_id,
+                    len: text.len(),
+                }],
+            )
+        };
+        let base = layout("a");
+        let single_space = layout("a ");
+        let double_space = layout("a  ");
+
+        assert!(single_space.width > base.width);
+        assert!(double_space.width > single_space.width);
     }
 }
