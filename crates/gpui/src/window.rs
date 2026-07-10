@@ -43,7 +43,7 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::{BorrowMutError, Cell, RefCell},
     cmp,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
@@ -154,14 +154,14 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
-        if inner.draw_phase == DrawPhase::None {
-            Self::record_frame_dirty(&mut inner);
-            inner.dirty = true;
-            cx.push_effect(Effect::Notify { emitter: entity });
-            true
-        } else {
-            false
-        }
+        // A view can be notified while an ancestor is being redrawn. The
+        // current frame may already have drained invalidated entities, so keep
+        // the window dirty for a follow-up frame and deliver the notification.
+        Self::record_frame_dirty(&mut inner);
+        inner.dirty = true;
+        drop(inner);
+        cx.push_effect(Effect::Notify { emitter: entity });
+        true
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -233,6 +233,57 @@ impl WindowInvalidator {
             ),
             "this method can only be called during request_layout, prepaint, or paint"
         );
+    }
+}
+
+fn is_transient_app_borrow_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BorrowMutError>().is_some()
+}
+
+fn requeue_next_frame_callbacks(
+    next_frame_callbacks: &Rc<RefCell<Vec<FrameCallback>>>,
+    mut callbacks: Vec<FrameCallback>,
+) {
+    if callbacks.is_empty() {
+        return;
+    }
+
+    let mut queued = next_frame_callbacks.borrow_mut();
+    if queued.is_empty() {
+        *queued = callbacks;
+    } else {
+        callbacks.append(&mut *queued);
+        *queued = callbacks;
+    }
+}
+
+fn flush_next_frame_callbacks<C>(
+    handle: AnyWindowHandle,
+    cx: &mut C,
+    next_frame_callbacks: &Rc<RefCell<Vec<FrameCallback>>>,
+) where
+    C: AppContext,
+{
+    let callbacks = next_frame_callbacks.take();
+    if callbacks.is_empty() {
+        return;
+    }
+
+    let mut callbacks = Some(callbacks);
+    let result = handle.update(cx, |_, window, cx| {
+        for callback in callbacks.take().unwrap() {
+            callback(window, cx);
+        }
+    });
+
+    match result {
+        Ok(()) => {}
+        Err(error) if is_transient_app_borrow_error(&error) => {
+            requeue_next_frame_callbacks(next_frame_callbacks, callbacks.take().unwrap());
+        }
+        Err(error) => {
+            Result::<()>::Err(error).log_err();
+        }
     }
 }
 
@@ -1621,16 +1672,7 @@ impl Window {
                 }
                 last_frame_time.set(Some(now));
 
-                let next_frame_callbacks = next_frame_callbacks.take();
-                if !next_frame_callbacks.is_empty() {
-                    handle
-                        .update(&mut cx, |_, window, cx| {
-                            for callback in next_frame_callbacks {
-                                callback(window, cx);
-                            }
-                        })
-                        .log_err();
-                }
+                flush_next_frame_callbacks(handle, &mut cx, &next_frame_callbacks);
 
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
