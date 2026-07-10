@@ -32,7 +32,7 @@ use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -2709,16 +2709,28 @@ impl Interactivity {
                     .and_then(|state| state.hover_state.as_ref())
                     .cloned()
             });
+            let transient_hover_state = (self.hover_style.is_some() && hover_state.is_none())
+                .then(|| Rc::new(Cell::new(hitbox.is_hovered(window))));
             let current_view = window.current_view();
 
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = hitbox.is_hovered(window);
                 let was_hovered = hover_state
                     .as_ref()
-                    .is_some_and(|state| state.borrow().element);
+                    .map(|state| state.borrow().element)
+                    .or_else(|| transient_hover_state.as_ref().map(|state| state.get()))
+                    .unwrap_or(false);
                 if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    if let Some(hover_state) = &hover_state {
+                    let did_update_hover_state = if let Some(hover_state) = &hover_state {
                         hover_state.borrow_mut().element = hovered;
+                        true
+                    } else if let Some(transient_hover_state) = &transient_hover_state {
+                        transient_hover_state.set(hovered);
+                        true
+                    } else {
+                        false
+                    };
+                    if did_update_hover_state {
                         cx.notify(current_view);
                     }
                 }
@@ -4294,6 +4306,72 @@ mod tests {
     impl Render for TestTooltipView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().w(px(20.)).h(px(20.)).child("tooltip")
+        }
+    }
+
+    struct StatelessHoverView;
+
+    impl Render for StatelessHoverView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .relative()
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .size(px(50.))
+                        .hover(|style| style.bg(crate::red())),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(50.))
+                        .top_0()
+                        .size(px(50.))
+                        .hover(|style| style.bg(crate::blue())),
+                )
+        }
+    }
+
+    #[test]
+    fn hover_without_element_id_invalidates_on_enter_exit_and_retarget() {
+        let mut test_app = TestAppContext::single();
+        let window = test_app.add_window(|_, _| StatelessHoverView);
+        let any_window = window.into();
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+
+        for position in [
+            point(px(150.), px(25.)),
+            point(px(25.), px(25.)),
+            point(px(75.), px(25.)),
+            point(px(150.), px(25.)),
+        ] {
+            test_app
+                .update_window(any_window, |_, window, cx| {
+                    let update_count = window.invalidator.update_count();
+                    window.dispatch_event(
+                        MouseMoveEvent {
+                            position,
+                            modifiers: Default::default(),
+                            pressed_button: None,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    assert!(
+                        window.invalidator.update_count() > update_count,
+                        "hover transition at {position:?} did not invalidate the view"
+                    );
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
         }
     }
 
