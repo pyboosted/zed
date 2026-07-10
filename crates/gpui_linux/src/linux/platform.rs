@@ -634,7 +634,11 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
-        self.inner.set_cursor_style(style)
+        if style == CursorStyle::Hidden {
+            self.inner.hide_cursor_until_mouse_moves()
+        } else {
+            self.inner.set_cursor_style(style)
+        }
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
@@ -923,6 +927,7 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
+        CursorStyle::Hidden => &[],
     }
 }
 

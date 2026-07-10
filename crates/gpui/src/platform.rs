@@ -190,6 +190,9 @@ pub trait Platform: 'static {
     fn open_with_system(&self, path: &Path);
 
     fn on_quit(&self, callback: Box<dyn FnMut()>);
+    fn on_should_quit(&self, callback: Box<dyn FnMut() -> bool>) {
+        let _ = callback;
+    }
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
     fn on_system_wake(&self, callback: Box<dyn FnMut()>);
 
@@ -2214,6 +2217,9 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// Hide the cursor while this style is active.
+    Hidden,
 }
 
 /// A clipboard item that should be copied to the clipboard

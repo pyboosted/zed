@@ -4909,6 +4909,11 @@ impl Window {
                 self.modifiers = pinch.modifiers;
                 PlatformInput::Pinch(pinch)
             }
+            PlatformInput::SmartMagnify(smart_magnify) => {
+                self.mouse_position = smart_magnify.position;
+                self.modifiers = smart_magnify.modifiers;
+                PlatformInput::SmartMagnify(smart_magnify)
+            }
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {

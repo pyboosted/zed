@@ -2,7 +2,7 @@ use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    ScrollMomentumPhase, ScrollWheelEvent, SmartMagnifyEvent, TouchPhase, point, px,
 };
 
 use crate::{
@@ -80,6 +80,26 @@ pub fn key_to_native(key: &str) -> Cow<'_, str> {
         _ => return Cow::Borrowed(key),
     };
     Cow::Owned(String::from_utf16(&[code]).unwrap())
+}
+
+pub(crate) unsafe fn smart_magnify_from_native(
+    native_event: id,
+    window_height: Pixels,
+) -> PlatformInput {
+    let phase = match unsafe { native_event.phase() } {
+        NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => TouchPhase::Started,
+        NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+        _ => TouchPhase::Moved,
+    };
+
+    PlatformInput::SmartMagnify(SmartMagnifyEvent {
+        position: point(
+            px(unsafe { native_event.locationInWindow().x as f32 }),
+            window_height - px(unsafe { native_event.locationInWindow().y as f32 }),
+        ),
+        modifiers: unsafe { read_modifiers(native_event) },
+        phase,
+    })
 }
 
 unsafe fn read_modifiers(native_event: id) -> Modifiers {
@@ -242,7 +262,6 @@ pub(crate) unsafe fn platform_input_from_native(
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
                     _ => TouchPhase::Moved,
                 };
-
                 let magnification = native_event.magnification() as f32;
 
                 PlatformInput::Pinch(PinchEvent {
@@ -263,6 +282,17 @@ pub(crate) unsafe fn platform_input_from_native(
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
                     _ => TouchPhase::Moved,
                 };
+                let momentum_phase = match native_event.momentumPhase() {
+                    NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
+                        ScrollMomentumPhase::Started
+                    }
+                    NSEventPhase::NSEventPhaseStationary | NSEventPhase::NSEventPhaseChanged => {
+                        ScrollMomentumPhase::Moving
+                    }
+                    NSEventPhase::NSEventPhaseEnded => ScrollMomentumPhase::Ended,
+                    NSEventPhase::NSEventPhaseCancelled => ScrollMomentumPhase::Cancelled,
+                    _ => ScrollMomentumPhase::None,
+                };
 
                 let raw_data = point(
                     native_event.scrollingDeltaX() as f32,
@@ -282,6 +312,7 @@ pub(crate) unsafe fn platform_input_from_native(
                     ),
                     delta,
                     touch_phase: phase,
+                    momentum_phase,
                     modifiers: read_modifiers(native_event),
                 })
             }),

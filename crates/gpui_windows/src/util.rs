@@ -91,6 +91,9 @@ pub(crate) fn windows_credentials_target_name(url: &str) -> String {
 }
 
 pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
+    if style == CursorStyle::Hidden {
+        return None;
+    }
     static ARROW: OnceLock<SafeCursor> = OnceLock::new();
     static IBEAM: OnceLock<SafeCursor> = OnceLock::new();
     static CROSS: OnceLock<SafeCursor> = OnceLock::new();

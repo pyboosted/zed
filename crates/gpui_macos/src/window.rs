@@ -194,6 +194,10 @@ unsafe fn build_classes() {
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
             decl.add_method(
+                sel!(smartMagnifyWithEvent:),
+                handle_smart_magnify_event as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
                 sel!(mouseDragged:),
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
@@ -2035,6 +2039,7 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            CursorStyle::Hidden => msg_send![class!(NSCursor), arrowCursor],
         };
 
         let bounds = NSView::bounds(this as *const Object as id);
@@ -2401,6 +2406,19 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             callback(event);
             window_state.lock().event_callback = Some(callback);
         }
+    }
+}
+
+extern "C" fn handle_smart_magnify_event(this: &Object, _: Sel, native_event: id) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    let window_height = lock.content_size().height;
+    let event = unsafe { super::events::smart_magnify_from_native(native_event, window_height) };
+
+    if let Some(mut callback) = lock.event_callback.take() {
+        drop(lock);
+        callback(event);
+        window_state.lock().event_callback = Some(callback);
     }
 }
 

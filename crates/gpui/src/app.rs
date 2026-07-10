@@ -2270,6 +2270,14 @@ impl App {
         subscription
     }
 
+    /// Register a callback invoked when the platform asks whether the app should quit.
+    /// Returning `false` cancels the native quit request.
+    pub fn on_should_quit(&self, mut on_should_quit: impl FnMut(&mut App) -> bool + 'static) {
+        let cx = self.to_async();
+        self.platform
+            .on_should_quit(Box::new(move || cx.update(|cx| on_should_quit(cx))));
+    }
+
     /// Register a callback to be invoked when a window is closed
     /// The window is no longer accessible at the point this callback is invoked.
     pub fn on_window_closed(
