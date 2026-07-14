@@ -992,6 +992,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -2149,6 +2150,78 @@ mod content_mask_tests {
         assert_eq!(scaled.rounded_clip_count, 1);
         assert_eq!(scaled.rounded_clips[0].bounds, bounds.scale(2.0));
         assert_eq!(scaled.rounded_clips[0].corner_radii.top_left.0, 10.0);
+    }
+}
+
+#[cfg(test)]
+mod cached_window_control_tests {
+    use super::*;
+    use crate::{StyleRefinement, TestAppContext, div, relative};
+
+    struct CachedWindowControl {
+        render_count: Rc<Cell<usize>>,
+    }
+
+    impl Render for CachedWindowControl {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            div()
+                .size_full()
+                .window_control_area(WindowControlArea::Drag)
+        }
+    }
+
+    struct CachedWindowControlHost {
+        control: Entity<CachedWindowControl>,
+        generation: usize,
+    }
+
+    impl Render for CachedWindowControlHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut style = StyleRefinement::default();
+            style.size.width = Some(relative(1.).into());
+            style.size.height = Some(relative(1.).into());
+
+            div()
+                .size_full()
+                .child(self.control.clone().cached(style))
+                .child(self.generation.to_string())
+        }
+    }
+
+    #[test]
+    fn cached_view_replays_window_control_hitboxes() {
+        let mut cx = TestAppContext::single();
+        let render_count = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let render_count = render_count.clone();
+            move |_, cx| CachedWindowControlHost {
+                control: cx.new(|_| CachedWindowControl { render_count }),
+                generation: 0,
+            }
+        });
+        let any_window = window.into();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(window.rendered_frame.window_control_hitboxes.len(), 1);
+        })
+        .unwrap();
+        let initial_render_count = render_count.get();
+
+        window
+            .update(&mut cx, |host, _, cx| {
+                host.generation += 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(window.rendered_frame.window_control_hitboxes.len(), 1);
+        })
+        .unwrap();
+
+        assert_eq!(render_count.get(), initial_render_count);
     }
 }
 
@@ -3572,6 +3645,7 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -3596,6 +3670,12 @@ impl Window {
                 [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
                 .iter_mut()
                 .map(|listener| listener.take()),
+        );
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
+                .iter()
+                .cloned(),
         );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
