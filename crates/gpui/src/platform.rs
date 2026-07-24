@@ -1761,6 +1761,14 @@ pub struct WindowOptions {
     /// Whether the window should be focused when created
     pub focus: bool,
 
+    /// How animation frames are scheduled while the window is inactive.
+    ///
+    /// The default throttles frame-driven work in background windows to save
+    /// energy. Use [`InactiveWindowFramePolicy::MatchDisplay`] for
+    /// non-activating windows that are part of an active user interaction,
+    /// such as a mouse-passthrough drag overlay.
+    pub inactive_frame_policy: InactiveWindowFramePolicy,
+
     /// Whether the window should be shown when created
     pub show: bool,
 
@@ -1925,6 +1933,7 @@ impl Default for WindowOptions {
                 traffic_light_position: Default::default(),
             }),
             focus: true,
+            inactive_frame_policy: InactiveWindowFramePolicy::default(),
             show: true,
             kind: WindowKind::Normal,
             is_movable: true,
@@ -1940,6 +1949,19 @@ impl Default for WindowOptions {
             tabbing_identifier: None,
         }
     }
+}
+
+/// Controls animation-frame scheduling when a window is inactive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InactiveWindowFramePolicy {
+    /// Cap frame-driven work in inactive windows to save energy.
+    #[default]
+    Throttle,
+    /// Schedule requested animation frames at display cadence.
+    ///
+    /// This only bypasses the inactive-window energy-saving cap. System
+    /// thermal-pressure limits still apply.
+    MatchDisplay,
 }
 
 /// The options that can be configured for a window's titlebar

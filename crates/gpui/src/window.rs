@@ -6,15 +6,15 @@ use crate::{
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SurfaceBuffer,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    Hsla, InactiveWindowFramePolicy, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent,
+    KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SurfaceBuffer, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
     Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
@@ -1245,6 +1245,28 @@ impl InputRateTracker {
     }
 }
 
+fn frame_throttle_interval(
+    force_render: bool,
+    require_presentation: bool,
+    has_next_frame_callbacks: bool,
+    active: bool,
+    inactive_frame_policy: InactiveWindowFramePolicy,
+    thermal_state: Option<ThermalState>,
+) -> Option<Duration> {
+    if !force_render && !require_presentation && !has_next_frame_callbacks {
+        None
+    } else if !active && inactive_frame_policy == InactiveWindowFramePolicy::Throttle {
+        Some(Duration::from_micros(33333))
+    } else if matches!(
+        thermal_state,
+        Some(ThermalState::Critical | ThermalState::Serious)
+    ) {
+        Some(Duration::from_micros(16667))
+    } else {
+        None
+    }
+}
+
 /// A point-in-time snapshot of the input-latency histograms for a window,
 /// suitable for external formatting.
 #[cfg(feature = "input-latency-histogram")]
@@ -1424,6 +1446,7 @@ impl Window {
             window_bounds,
             titlebar,
             focus,
+            inactive_frame_policy,
             show,
             kind,
             is_movable,
@@ -1639,18 +1662,14 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let min_frame_interval = if !force_render
-                    && !request_frame_options.require_presentation
-                    && next_frame_callbacks.borrow().is_empty()
-                {
-                    None
-                } else if !active.get() {
-                    Some(Duration::from_micros(33333))
-                } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
-                    Some(Duration::from_micros(16667))
-                } else {
-                    None
-                };
+                let min_frame_interval = frame_throttle_interval(
+                    force_render,
+                    request_frame_options.require_presentation,
+                    !next_frame_callbacks.borrow().is_empty(),
+                    active.get(),
+                    inactive_frame_policy,
+                    thermal_state,
+                );
 
                 let now = Instant::now();
                 if let Some(min_interval) = min_frame_interval {
@@ -6976,13 +6995,103 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, rc::Rc, time::Duration};
 
     use crate::{
-        AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement, Pixels, Render, Styled, TestAppContext, Window, WindowOptions, canvas, div,
-        px, size,
+        AppContext as _, Bounds, Context, FocusHandle, InactiveWindowFramePolicy,
+        InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, Styled,
+        TestAppContext, ThermalState, Window, WindowOptions, canvas, div, px, size,
     };
+
+    use super::frame_throttle_interval;
+
+    #[test]
+    fn test_inactive_window_frame_policy() {
+        let inactive_interval = Duration::from_micros(33333);
+        let thermal_interval = Duration::from_micros(16667);
+
+        assert_eq!(
+            InactiveWindowFramePolicy::default(),
+            InactiveWindowFramePolicy::Throttle,
+        );
+        assert_eq!(
+            frame_throttle_interval(
+                false,
+                false,
+                true,
+                false,
+                InactiveWindowFramePolicy::Throttle,
+                Some(ThermalState::Nominal),
+            ),
+            Some(inactive_interval),
+        );
+        assert_eq!(
+            frame_throttle_interval(
+                true,
+                false,
+                false,
+                false,
+                InactiveWindowFramePolicy::Throttle,
+                Some(ThermalState::Nominal),
+            ),
+            Some(inactive_interval),
+        );
+        assert_eq!(
+            frame_throttle_interval(
+                false,
+                true,
+                false,
+                false,
+                InactiveWindowFramePolicy::Throttle,
+                Some(ThermalState::Nominal),
+            ),
+            Some(inactive_interval),
+        );
+        assert_eq!(
+            frame_throttle_interval(
+                false,
+                false,
+                true,
+                false,
+                InactiveWindowFramePolicy::MatchDisplay,
+                Some(ThermalState::Nominal),
+            ),
+            None,
+        );
+        assert_eq!(
+            frame_throttle_interval(
+                false,
+                false,
+                true,
+                false,
+                InactiveWindowFramePolicy::MatchDisplay,
+                Some(ThermalState::Serious),
+            ),
+            Some(thermal_interval),
+        );
+        assert_eq!(
+            frame_throttle_interval(
+                false,
+                false,
+                true,
+                true,
+                InactiveWindowFramePolicy::Throttle,
+                Some(ThermalState::Critical),
+            ),
+            Some(thermal_interval),
+        );
+        assert_eq!(
+            frame_throttle_interval(
+                false,
+                false,
+                false,
+                false,
+                InactiveWindowFramePolicy::Throttle,
+                Some(ThermalState::Critical),
+            ),
+            None,
+        );
+    }
 
     struct EmptyView;
 
