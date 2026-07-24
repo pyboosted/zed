@@ -2223,6 +2223,55 @@ mod cached_window_control_tests {
 
         assert_eq!(render_count.get(), initial_render_count);
     }
+
+    struct DragSourcePreview;
+
+    impl Render for DragSourcePreview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size(px(8.))
+        }
+    }
+
+    #[test]
+    fn hidden_drag_source_preview_does_not_refresh_on_mouse_move() {
+        let mut cx = TestAppContext::single();
+        let render_count = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let render_count = render_count.clone();
+            move |_, cx| CachedWindowControlHost {
+                control: cx.new(|_| CachedWindowControl { render_count }),
+                generation: 0,
+            }
+        });
+        let any_window = window.into();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+            window.draw(cx).clear(cx);
+
+            cx.active_drag = Some(AnyDrag {
+                view: cx.new(|_| DragSourcePreview).into(),
+                value: Arc::new(()),
+                cursor_offset: point(px(0.), px(0.)),
+                cursor_style: None,
+                source_preview_visible: true,
+            });
+            assert!(cx.set_active_drag_source_preview_visible(false, window));
+            window.draw(cx).clear(cx);
+            let update_count = window.invalidator.update_count();
+            let initial_render_count = render_count.get();
+
+            for x in 11..21 {
+                window.simulate_mouse_move(point(px(x as f32), px(10.)), cx);
+            }
+
+            assert_eq!(window.invalidator.update_count(), update_count);
+            assert_eq!(render_count.get(), initial_render_count);
+            assert_eq!(cx.active_drag_source_preview_visible(), Some(false));
+        })
+        .unwrap();
+    }
 }
 
 impl Window {
@@ -3333,10 +3382,12 @@ impl Window {
             prompt_element = Some(element);
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
-            let mut element = active_drag.view.clone().into_any_element();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
-            active_drag_element = Some(element);
+            if active_drag.source_preview_visible {
+                let mut element = active_drag.view.clone().into_any_element();
+                let offset = self.mouse_position() - active_drag.cursor_offset;
+                element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+                active_drag_element = Some(element);
+            }
             cx.active_drag = Some(active_drag);
         } else {
             tooltip_element = self.prepaint_tooltip(cx);
@@ -5191,6 +5242,7 @@ impl Window {
                             view: cx.new(|_| paths).into(),
                             cursor_offset: position,
                             cursor_style: None,
+                            source_preview_visible: true,
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -5291,7 +5343,9 @@ impl Window {
             if event.is::<MouseMoveEvent>() {
                 // If this was a mouse move event, redraw the window so that the
                 // active drag can follow the mouse cursor.
-                self.refresh();
+                if cx.active_drag_source_preview_visible() == Some(true) {
+                    self.refresh();
+                }
             } else if event.is::<MouseUpEvent>() {
                 // If this was a mouse up event, cancel the active drag and redraw
                 // the window.

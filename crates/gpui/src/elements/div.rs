@@ -2860,6 +2860,7 @@ impl Interactivity {
                                 value: drag_value,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
+                                source_preview_visible: true,
                             });
                             pending_mouse_down.take();
                             window.refresh();

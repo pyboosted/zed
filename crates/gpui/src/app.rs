@@ -2429,6 +2429,40 @@ impl App {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
     }
 
+    /// Returns whether the currently active drag uses GPUI's source-window
+    /// preview. When disabled, the drag still dispatches move and drop events,
+    /// but GPUI does not redraw the source window merely to follow the cursor.
+    pub fn active_drag_source_preview_visible(&self) -> Option<bool> {
+        self.active_drag
+            .as_ref()
+            .map(|drag| drag.source_preview_visible)
+    }
+
+    /// Controls GPUI's source-window preview for the currently active drag.
+    ///
+    /// This is useful for drags whose feedback is rendered by another surface,
+    /// such as one overlay window per display. Disabling the preview also
+    /// suppresses GPUI's otherwise unconditional source-window refresh on
+    /// every mouse move. Drag capture, move delivery, drops, and cancellation
+    /// are unaffected.
+    ///
+    /// The default is `true` for all internal and external drags.
+    pub fn set_active_drag_source_preview_visible(
+        &mut self,
+        visible: bool,
+        window: &mut Window,
+    ) -> bool {
+        let Some(drag) = self.active_drag.as_mut() else {
+            return false;
+        };
+        if drag.source_preview_visible == visible {
+            return false;
+        }
+        drag.source_preview_visible = visible;
+        window.refresh();
+        true
+    }
+
     /// Stops active drag and clears any related effects.
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
@@ -2808,6 +2842,10 @@ pub struct AnyDrag {
 
     /// The cursor style to use while dragging
     pub cursor_style: Option<CursorStyle>,
+
+    /// Whether GPUI renders this drag in the source window and refreshes that
+    /// window on every mouse move so the preview follows the cursor.
+    pub source_preview_visible: bool,
 }
 
 /// Contains state associated with a tooltip. You'll only need this struct if you're implementing
