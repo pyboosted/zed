@@ -2788,6 +2788,17 @@ impl Window {
         self.platform_window.bounds()
     }
 
+    /// Returns the native platform window identifier when available.
+    pub fn native_window_id(&self) -> Option<u64> {
+        self.platform_window.native_window_id()
+    }
+
+    /// Captures the current rendered scene to a PNG file when supported by the platform backend.
+    pub fn capture_png(&self, path: &std::path::Path) -> Result<()> {
+        self.platform_window
+            .capture_png(&self.rendered_frame.scene, path)
+    }
+
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.

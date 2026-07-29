@@ -4,7 +4,6 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -1211,6 +1210,11 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().bounds()
     }
 
+    fn native_window_id(&self) -> Option<u64> {
+        let window_number = unsafe { self.0.as_ref().lock().native_window.windowNumber() };
+        (window_number >= 0).then_some(window_number as u64)
+    }
+
     fn window_bounds(&self) -> WindowBounds {
         self.0.as_ref().lock().window_bounds()
     }
@@ -1767,6 +1771,12 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+    }
+
+    fn capture_png(&self, scene: &gpui::Scene, path: &std::path::Path) -> Result<()> {
+        let mut this = self.0.lock();
+        this.renderer.render_to_image(scene)?.save(path)?;
+        Ok(())
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
