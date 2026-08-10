@@ -990,7 +990,7 @@ fn fs_effect(input: EffectVarying) -> @location(0) vec4<f32> {
     var color = hsla_to_rgba(effect.color);
     var elapsed = globals.motion_time_seconds - effect.started_at;
     if (elapsed < 0.0) {
-        elapsed += 4096.0;
+        elapsed += 4095.0;
     }
     if (effect.kind == 0u) {
         let phase = fract(elapsed / max(effect.duration, 0.001));

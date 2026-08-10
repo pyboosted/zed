@@ -450,7 +450,7 @@ fragment float4 effect_fragment(
   float4 color = hsla_to_rgba(effect.color);
   float elapsed = *motion_time_seconds - effect.started_at;
   if (elapsed < 0.0) {
-    elapsed += 4096.0;
+    elapsed += 4095.0;
   }
   if (effect.kind == 0u) {
     float phase = fract(elapsed / max(effect.duration, 0.001));

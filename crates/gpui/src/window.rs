@@ -1269,8 +1269,11 @@ fn frame_throttle_interval(
     }
 }
 
-const EFFECT_MOTION_TIME_WRAP_SECONDS: f32 = 4096.0;
-const EFFECT_MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+// Keep the bounded f32 clock continuous for every built-in periodic effect.
+// 4095 seconds is an exact common multiple of the 0.9 s spinner period and
+// the 0.7 s attention duration.
+const EFFECT_MOTION_TIME_WRAP_SECONDS: f32 = 4095.0;
+const EFFECT_MOTION_FRAME_INTERVAL: Duration = Duration::from_micros(33_334);
 const SPINNER_PERIOD_SECONDS: f32 = 0.9;
 const ATTENTION_HIGHLIGHT_DURATION: Duration = Duration::from_millis(700);
 
@@ -7215,7 +7218,9 @@ mod tests {
     };
 
     use super::{
-        EffectAnimation, Instant, MotionPresentationState, MotionSchedule, frame_throttle_interval,
+        ATTENTION_HIGHLIGHT_DURATION, EFFECT_MOTION_FRAME_INTERVAL,
+        EFFECT_MOTION_TIME_WRAP_SECONDS, EffectAnimation, Instant, MotionPresentationState,
+        MotionSchedule, SPINNER_PERIOD_SECONDS, frame_throttle_interval,
     };
 
     #[test]
@@ -7513,5 +7518,20 @@ mod tests {
             presentation.next_deadline,
             Some(now + Duration::from_millis(132))
         );
+    }
+
+    #[test]
+    fn effect_clock_wrap_is_continuous_for_builtin_periods() {
+        for period in [
+            SPINNER_PERIOD_SECONDS,
+            ATTENTION_HIGHLIGHT_DURATION.as_secs_f32(),
+        ] {
+            let cycles = EFFECT_MOTION_TIME_WRAP_SECONDS / period;
+            assert!(
+                (cycles - cycles.round()).abs() <= f32::EPSILON,
+                "motion clock wrap must contain a whole number of {period}s cycles"
+            );
+        }
+        assert!(EFFECT_MOTION_FRAME_INTERVAL >= Duration::from_secs_f64(1.0 / 30.0));
     }
 }
