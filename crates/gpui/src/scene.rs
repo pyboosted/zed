@@ -8,11 +8,13 @@ use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
+use scheduler::Instant;
 use std::{
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    time::Duration,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -44,12 +46,66 @@ pub struct Scene {
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
+    pub effects: Vec<EffectQuad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    motion_schedule: MotionSchedule,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MotionSchedule {
+    buckets: Vec<MotionScheduleBucket>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MotionScheduleBucket {
+    frame_interval: Duration,
+    latest_end: Option<Instant>,
+}
+
+impl MotionSchedule {
+    pub(crate) fn register(&mut self, animation: EffectAnimation) {
+        if let Some(bucket) = self
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.frame_interval == animation.frame_interval)
+        {
+            bucket.latest_end = match (bucket.latest_end, animation.ends_at) {
+                (None, _) | (_, None) => None,
+                (Some(current), Some(incoming)) => Some(current.max(incoming)),
+            };
+        } else {
+            self.buckets.push(MotionScheduleBucket {
+                frame_interval: animation.frame_interval,
+                latest_end: animation.ends_at,
+            });
+        }
+    }
+
+    pub(crate) fn active_frame_interval(&self, now: Instant) -> Option<Duration> {
+        self.buckets
+            .iter()
+            .filter(|bucket| bucket.latest_end.is_none_or(|end| now < end))
+            .map(|bucket| bucket.frame_interval)
+            .min()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EffectAnimation {
+    pub(crate) frame_interval: Duration,
+    pub(crate) ends_at: Option<Instant>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct EffectPrimitive {
+    pub(crate) instance: EffectQuad,
+    pub(crate) animation: Option<EffectAnimation>,
 }
 
 #[expect(missing_docs)]
@@ -61,11 +117,13 @@ impl Scene {
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
+        self.effects.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.motion_schedule = MotionSchedule::default();
     }
 
     pub fn len(&self) -> usize {
@@ -107,6 +165,13 @@ impl Scene {
             Primitive::Quad(quad) => {
                 quad.order = order;
                 self.quads.push(*quad);
+            }
+            Primitive::Effect(effect) => {
+                effect.instance.order = order;
+                self.effects.push(effect.instance);
+                if let Some(animation) = effect.animation {
+                    self.motion_schedule.register(animation);
+                }
             }
             Primitive::Path(path) => {
                 path.order = order;
@@ -151,6 +216,7 @@ impl Scene {
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
+        self.effects.sort_by_key(|effect| effect.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -160,6 +226,10 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+    }
+
+    pub(crate) fn motion_schedule(&self) -> &MotionSchedule {
+        &self.motion_schedule
     }
 
     #[cfg_attr(
@@ -175,6 +245,8 @@ impl Scene {
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
+            effects_start: 0,
+            effects_iter: self.effects.iter().peekable(),
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
@@ -203,6 +275,7 @@ pub(crate) enum PrimitiveKind {
     Shadow,
     #[default]
     Quad,
+    Effect,
     Path,
     Underline,
     MonochromeSprite,
@@ -222,6 +295,7 @@ pub(crate) enum PaintOperation {
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
+    Effect(EffectPrimitive),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -236,6 +310,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
+            Primitive::Effect(effect) => &effect.instance.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -249,6 +324,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
+            Primitive::Effect(effect) => &effect.instance.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -271,6 +347,8 @@ struct BatchIterator<'a> {
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
+    effects_start: usize,
+    effects_iter: Peekable<slice::Iter<'a, EffectQuad>>,
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
@@ -295,6 +373,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::Shadow,
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
+            (
+                self.effects_iter.peek().map(|effect| effect.order),
+                PrimitiveKind::Effect,
+            ),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
             (
                 self.underlines_iter.peek().map(|u| u.order),
@@ -355,6 +437,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 }
                 self.quads_start = quads_end;
                 Some(PrimitiveBatch::Quads(quads_start..quads_end))
+            }
+            PrimitiveKind::Effect => {
+                let effects_start = self.effects_start;
+                let mut effects_end = effects_start + 1;
+                self.effects_iter.next();
+                while self
+                    .effects_iter
+                    .next_if(|effect| (effect.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    effects_end += 1;
+                }
+                self.effects_start = effects_end;
+                Some(PrimitiveBatch::Effects(effects_start..effects_end))
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -477,6 +573,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),
+    Effects(Range<usize>),
     Paths(Range<usize>),
     Underlines(Range<usize>),
     MonochromeSprites {
@@ -501,6 +598,7 @@ impl PrimitiveBatch {
         match self {
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
+            Self::Effects(range) => format!("effects ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => {
@@ -546,6 +644,30 @@ pub struct Quad {
 impl From<Quad> for Primitive {
     fn from(quad: Quad) -> Self {
         Primitive::Quad(quad)
+    }
+}
+
+#[derive(Default, Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct EffectQuad {
+    pub order: DrawOrder,
+    pub kind: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: Hsla,
+    pub accent_color: Hsla,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub started_at: f32,
+    pub duration: f32,
+    pub intensity: f32,
+    pub thickness: ScaledPixels,
+    pub feather: ScaledPixels,
+}
+
+impl From<EffectPrimitive> for Primitive {
+    fn from(effect: EffectPrimitive) -> Self {
+        Primitive::Effect(effect)
     }
 }
 
@@ -945,5 +1067,52 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn motion_schedule_uses_fastest_active_bucket() {
+        let now = Instant::now();
+        let mut schedule = MotionSchedule::default();
+        schedule.register(EffectAnimation {
+            frame_interval: Duration::from_millis(33),
+            ends_at: None,
+        });
+        schedule.register(EffectAnimation {
+            frame_interval: Duration::from_millis(16),
+            ends_at: Some(now + Duration::from_millis(100)),
+        });
+
+        assert_eq!(
+            schedule.active_frame_interval(now),
+            Some(Duration::from_millis(16))
+        );
+        assert_eq!(
+            schedule.active_frame_interval(now + Duration::from_millis(100)),
+            Some(Duration::from_millis(33))
+        );
+    }
+
+    #[test]
+    fn motion_schedule_merges_equal_cadence_without_losing_repeating_effects() {
+        let now = Instant::now();
+        let mut schedule = MotionSchedule::default();
+        schedule.register(EffectAnimation {
+            frame_interval: Duration::from_millis(33),
+            ends_at: Some(now + Duration::from_millis(100)),
+        });
+        schedule.register(EffectAnimation {
+            frame_interval: Duration::from_millis(33),
+            ends_at: None,
+        });
+
+        assert_eq!(
+            schedule.active_frame_interval(now + Duration::from_secs(10)),
+            Some(Duration::from_millis(33))
+        );
     }
 }

@@ -406,6 +406,93 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return color;
 }
 
+struct EffectVertexOutput {
+  uint effect_id [[flat]];
+  float2 unit_position;
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct EffectFragmentInput {
+  uint effect_id [[flat]];
+  float2 unit_position;
+  float4 position [[position]];
+};
+
+vertex EffectVertexOutput effect_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    uint effect_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(EffectInputIndex_Vertices)]],
+    constant EffectQuad *effects [[buffer(EffectInputIndex_Effects)]],
+    constant Size_DevicePixels *viewport_size [[buffer(EffectInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  EffectQuad effect = effects[effect_id];
+  float4 clip_distance = distance_from_clip_rect(
+      unit_vertex, effect.bounds, effect.content_mask.bounds);
+
+  return EffectVertexOutput{
+      effect_id,
+      unit_vertex,
+      to_device_position(unit_vertex, effect.bounds, viewport_size),
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 effect_fragment(
+    EffectFragmentInput input [[stage_in]],
+    constant EffectQuad *effects [[buffer(EffectInputIndex_Effects)]],
+    constant float *motion_time_seconds [[buffer(EffectInputIndex_MotionTime)]]) {
+  EffectQuad effect = effects[input.effect_id];
+  float clip_alpha = content_mask_alpha(input.position.xy, effect.content_mask);
+  if (clip_alpha <= 0.0) {
+    return float4(0.0);
+  }
+
+  float4 color = hsla_to_rgba(effect.color);
+  float elapsed = *motion_time_seconds - effect.started_at;
+  if (elapsed < 0.0) {
+    elapsed += 4096.0;
+  }
+  if (effect.kind == 0u) {
+    float phase = fract(elapsed / max(effect.duration, 0.001));
+    float2 local = input.position.xy
+        - float2(effect.bounds.origin.x, effect.bounds.origin.y)
+        - float2(effect.bounds.size.width, effect.bounds.size.height) * 0.5;
+    float radius = max(0.0,
+        min(effect.bounds.size.width, effect.bounds.size.height) * 0.5
+        - effect.thickness * 0.5 - effect.feather);
+    float ring_distance = abs(length(local) - radius);
+    float ring_alpha = 1.0 - smoothstep(
+        effect.thickness * 0.5,
+        effect.thickness * 0.5 + max(effect.feather, 0.5),
+        ring_distance);
+    float angle = atan2(local.y, local.x) / (2.0 * M_PI_F) + 0.5;
+    float delta = fmod(phase - angle + 1.0, 1.0);
+    float arc_length = 0.78;
+    float arc_alpha = delta <= arc_length
+        ? (0.18 + 0.82 * (1.0 - delta / arc_length))
+        : 0.0;
+    color.a *= ring_alpha * arc_alpha * effect.intensity * clip_alpha;
+    return color;
+  }
+
+  if (effect.duration <= 0.0) {
+    color.a *= effect.intensity * clip_alpha;
+    return color;
+  }
+
+  float phase = saturate(elapsed / effect.duration);
+  float4 accent = hsla_to_rgba(effect.accent_color);
+  float sweep_center = phase * 1.4 - 0.2;
+  float sweep_delta = (input.unit_position.x - sweep_center) / 0.16;
+  float sweep = exp(-sweep_delta * sweep_delta);
+  float decay = 1.0 - phase;
+  decay *= decay;
+  color = mix(color, accent, sweep);
+  color.a *= decay * (0.72 + 0.28 * sweep)
+      * effect.intensity * clip_alpha;
+  return color;
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //

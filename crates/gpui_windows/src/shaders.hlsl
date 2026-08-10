@@ -6,7 +6,8 @@ cbuffer GlobalParams: register(b0) {
     float grayscale_enhanced_contrast;
     float subpixel_enhanced_contrast;
     uint is_bgr;
-    uint3 global_pad;
+    float motion_time_seconds;
+    uint2 global_pad;
 };
 
 Texture2D<float4> t_sprite: register(t0);
@@ -573,6 +574,21 @@ struct Quad {
     Edges border_widths;
 };
 
+struct EffectQuad {
+    uint order;
+    uint kind;
+    Bounds bounds;
+    ContentMask content_mask;
+    Hsla color;
+    Hsla accent_color;
+    Corners corner_radii;
+    float started_at;
+    float duration;
+    float intensity;
+    float thickness;
+    float feather;
+};
+
 struct QuadVertexOutput {
     nointerpolation uint quad_id: TEXCOORD0;
     float4 position: SV_Position;
@@ -914,6 +930,94 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     }
 
     color.a *= saturate(antialias_threshold - outer_sdf) * clip_alpha;
+    return color;
+}
+
+/*
+**
+**              Procedural effects
+**
+*/
+
+struct EffectVertexOutput {
+    nointerpolation uint effect_id: TEXCOORD0;
+    float2 unit_position: TEXCOORD1;
+    float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct EffectFragmentInput {
+    nointerpolation uint effect_id: TEXCOORD0;
+    float2 unit_position: TEXCOORD1;
+    float4 position: SV_Position;
+};
+
+StructuredBuffer<EffectQuad> effects: register(t1);
+
+EffectVertexOutput effect_vertex(uint vertex_id: SV_VertexID, uint effect_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    EffectQuad effect = effects[effect_id];
+
+    EffectVertexOutput output;
+    output.effect_id = effect_id;
+    output.unit_position = unit_vertex;
+    output.position = to_device_position(unit_vertex, effect.bounds);
+    output.clip_distance = distance_from_clip_rect(
+        unit_vertex,
+        effect.bounds,
+        effect.content_mask.bounds
+    );
+    return output;
+}
+
+float4 effect_fragment(EffectFragmentInput input): SV_Target {
+    EffectQuad effect = effects[input.effect_id];
+    float clip_alpha = content_mask_alpha(input.position.xy, effect.content_mask);
+    if (clip_alpha <= 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float4 color = hsla_to_rgba(effect.color);
+    float elapsed = motion_time_seconds - effect.started_at;
+    if (elapsed < 0.0) {
+        elapsed += 4096.0;
+    }
+    if (effect.kind == 0u) {
+        float phase = frac(elapsed / max(effect.duration, 0.001));
+        float2 local = input.position.xy - effect.bounds.origin - effect.bounds.size * 0.5;
+        float radius = max(0.0, min(effect.bounds.size.x, effect.bounds.size.y) * 0.5
+            - effect.thickness * 0.5 - effect.feather);
+        float ring_distance = abs(length(local) - radius);
+        float ring_alpha = 1.0 - smoothstep(
+            effect.thickness * 0.5,
+            effect.thickness * 0.5 + max(effect.feather, 0.5),
+            ring_distance
+        );
+        float angle = atan2(local.y, local.x) / (2.0 * M_PI_F) + 0.5;
+        float delta = fmod(phase - angle + 1.0, 1.0);
+        float arc_length = 0.78;
+        float arc_alpha = delta <= arc_length
+            ? (0.18 + 0.82 * (1.0 - delta / arc_length))
+            : 0.0;
+        color.a *= ring_alpha * arc_alpha * effect.intensity * clip_alpha;
+        return color;
+    }
+
+    if (effect.duration <= 0.0) {
+        color.a *= effect.intensity * clip_alpha;
+        return color;
+    }
+
+    float phase = saturate(elapsed / effect.duration);
+    float4 accent = hsla_to_rgba(effect.accent_color);
+    float sweep_center = phase * 1.4 - 0.2;
+    float sweep_delta = (input.unit_position.x - sweep_center) / 0.16;
+    float sweep = exp(-sweep_delta * sweep_delta);
+    float decay = 1.0 - phase;
+    decay *= decay;
+    color = lerp(color, accent, sweep);
+    color.a *= decay * (0.72 + 0.28 * sweep)
+        * effect.intensity * clip_alpha;
     return color;
 }
 

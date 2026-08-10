@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, EffectQuad, GpuSpecs, MonochromeSprite, Path,
+    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, effect_time_seconds, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    motion_time_seconds: f32,
 }
 
 #[repr(C)]
@@ -42,6 +42,59 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PodEffect {
+    order: u32,
+    kind: u32,
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    color: [f32; 4],
+    accent_color: [f32; 4],
+    corner_radii: [f32; 4],
+    started_at: f32,
+    duration: f32,
+    intensity: f32,
+    thickness: f32,
+    feather: f32,
+    pad: f32,
+}
+
+impl From<&EffectQuad> for PodEffect {
+    fn from(effect: &EffectQuad) -> Self {
+        Self {
+            order: effect.order,
+            kind: effect.kind,
+            bounds: effect.bounds.into(),
+            content_mask: effect.content_mask.bounds.into(),
+            color: [
+                effect.color.h,
+                effect.color.s,
+                effect.color.l,
+                effect.color.a,
+            ],
+            accent_color: [
+                effect.accent_color.h,
+                effect.accent_color.s,
+                effect.accent_color.l,
+                effect.accent_color.a,
+            ],
+            corner_radii: [
+                effect.corner_radii.top_left.0,
+                effect.corner_radii.top_right.0,
+                effect.corner_radii.bottom_right.0,
+                effect.corner_radii.bottom_left.0,
+            ],
+            started_at: effect.started_at,
+            duration: effect.duration,
+            intensity: effect.intensity,
+            thickness: effect.thickness.0,
+            feather: effect.feather.0,
+            pad: 0.0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -83,6 +136,7 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    effects: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -739,6 +793,18 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let effects = create_pipeline(
+            "effects",
+            "vs_effect",
+            "fs_effect",
+            &layouts.globals,
+            &layouts.instances,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let shadows = create_pipeline(
             "shadows",
             "vs_shadow",
@@ -879,6 +945,7 @@ impl WgpuRenderer {
 
         WgpuPipelines {
             quads,
+            effects,
             shadows,
             path_rasterization,
             paths,
@@ -1175,7 +1242,7 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            pad: 0,
+            motion_time_seconds: effect_time_seconds(),
         };
 
         let path_globals = GlobalParams {
@@ -1234,6 +1301,11 @@ impl WgpuRenderer {
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
                         }
+                        PrimitiveBatch::Effects(range) => self.draw_effects(
+                            &scene.effects[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                         PrimitiveBatch::Shadows(range) => self.draw_shadows(
                             &scene.shadows[range],
                             &mut instance_offset,
@@ -1350,6 +1422,23 @@ impl WgpuRenderer {
             data,
             quads.len() as u32,
             &self.resources().pipelines.quads,
+            instance_offset,
+            pass,
+        )
+    }
+
+    fn draw_effects(
+        &self,
+        effects: &[EffectQuad],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let effects = effects.iter().map(PodEffect::from).collect::<Vec<_>>();
+        let data = bytemuck::cast_slice(&effects);
+        self.draw_instances(
+            data,
+            effects.len() as u32,
+            &self.resources().pipelines.effects,
             instance_offset,
             pass,
         )

@@ -1,13 +1,14 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::scene::{EffectAnimation, EffectPrimitive, MotionSchedule};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InactiveWindowFramePolicy, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent,
-    KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, EffectQuad,
+    Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InactiveWindowFramePolicy, InputHandler, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
     Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
@@ -50,7 +51,7 @@ use std::{
     ops::{DerefMut, Range},
     rc::Rc,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     },
     time::Duration,
@@ -1168,6 +1169,7 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    motion_presentation: Rc<RefCell<MotionPresentationState>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1264,6 +1266,71 @@ fn frame_throttle_interval(
         Some(Duration::from_micros(16667))
     } else {
         None
+    }
+}
+
+const EFFECT_MOTION_TIME_WRAP_SECONDS: f32 = 4096.0;
+const EFFECT_MOTION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const SPINNER_PERIOD_SECONDS: f32 = 0.9;
+const ATTENTION_HIGHLIGHT_DURATION: Duration = Duration::from_millis(700);
+
+/// Returns the renderer clock used by procedural effects.
+///
+/// This is public for GPUI renderer backends. Product code should use effect
+/// constructors instead of depending on the clock directly.
+#[doc(hidden)]
+pub fn effect_time_seconds() -> f32 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let elapsed = Instant::now().duration_since(*ORIGIN.get_or_init(Instant::now));
+    (elapsed.as_secs_f64() % f64::from(EFFECT_MOTION_TIME_WRAP_SECONDS)) as f32
+}
+
+#[derive(Default)]
+struct MotionPresentationState {
+    generation: u64,
+    schedule: MotionSchedule,
+    next_deadline: Option<Instant>,
+}
+
+impl MotionPresentationState {
+    fn replace_schedule(&mut self, schedule: &MotionSchedule, now: Instant) {
+        let previous_interval = self.schedule.active_frame_interval(now);
+        self.generation = self.generation.wrapping_add(1);
+        self.schedule = schedule.clone();
+        let next_interval = self.schedule.active_frame_interval(now);
+        if next_interval.is_none() {
+            self.next_deadline = None;
+        } else if self.next_deadline.is_none() || next_interval != previous_interval {
+            self.next_deadline = next_interval.map(|interval| now + interval);
+        }
+    }
+
+    fn presentation_due(&mut self, now: Instant) -> bool {
+        let Some(interval) = self.schedule.active_frame_interval(now) else {
+            self.next_deadline = None;
+            return false;
+        };
+        let deadline = *self.next_deadline.get_or_insert(now + interval);
+        now >= deadline
+    }
+
+    fn did_present(&mut self, now: Instant) {
+        let Some(interval) = self.schedule.active_frame_interval(now) else {
+            self.next_deadline = None;
+            return;
+        };
+        let Some(deadline) = self.next_deadline else {
+            self.next_deadline = Some(now + interval);
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+
+        let interval_nanos = interval.as_nanos().max(1);
+        let elapsed_intervals = now.duration_since(deadline).as_nanos() / interval_nanos + 1;
+        self.next_deadline =
+            Some(deadline + interval.mul_f64(elapsed_intervals.min(u128::from(u32::MAX)) as f64));
     }
 }
 
@@ -1512,6 +1579,7 @@ impl Window {
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let motion_presentation = Rc::new(RefCell::new(MotionPresentationState::default()));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
@@ -1627,6 +1695,7 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
+            let motion_presentation = motion_presentation.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
                 // This must be checked before anything else: if this request
@@ -1662,16 +1731,17 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
+                let now = Instant::now();
+                let motion_due = motion_presentation.borrow_mut().presentation_due(now);
                 let min_frame_interval = frame_throttle_interval(
                     force_render,
-                    request_frame_options.require_presentation,
+                    request_frame_options.require_presentation || motion_due,
                     !next_frame_callbacks.borrow().is_empty(),
                     active.get(),
                     inactive_frame_policy,
                     thermal_state,
                 );
 
-                let now = Instant::now();
                 if let Some(min_interval) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
@@ -1697,6 +1767,7 @@ impl Window {
                 // to prevent display underclocking during active input.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
+                    || motion_due
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
                 if invalidator.is_dirty() || force_render {
@@ -1917,6 +1988,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            motion_presentation,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -3240,6 +3312,9 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.motion_presentation
+            .borrow_mut()
+            .replace_schedule(self.rendered_frame.scene.motion_schedule(), Instant::now());
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -3330,6 +3405,9 @@ impl Window {
     #[profiling::function]
     fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
+        self.motion_presentation
+            .borrow_mut()
+            .did_present(Instant::now());
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
@@ -4425,6 +4503,32 @@ impl Window {
                 });
             }
         }
+    }
+
+    /// Paints a procedural effect at the current stacking context.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_effect(&mut self, effect: PaintEffect) {
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(EffectPrimitive {
+            instance: EffectQuad {
+                order: 0,
+                kind: effect.kind as u32,
+                bounds: self.snap_bounds(effect.bounds),
+                content_mask: self.snapped_content_mask(),
+                color: effect.color.opacity(opacity),
+                accent_color: effect.accent_color.opacity(opacity),
+                corner_radii: effect.corner_radii.scale(self.scale_factor()),
+                started_at: effect.started_at,
+                duration: effect.duration,
+                intensity: effect.intensity,
+                thickness: effect.thickness.scale(self.scale_factor()),
+                feather: effect.feather.scale(self.scale_factor()),
+            },
+            animation: effect.animation,
+        });
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
@@ -6923,6 +7027,102 @@ pub struct PaintQuad {
     pub border_style: BorderStyle,
 }
 
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum PaintEffectKind {
+    Spinner = 0,
+    Highlight = 1,
+}
+
+/// A procedural effect rendered inside a rectangular region.
+#[derive(Clone)]
+pub struct PaintEffect {
+    bounds: Bounds<Pixels>,
+    corner_radii: Corners<Pixels>,
+    color: Hsla,
+    accent_color: Hsla,
+    kind: PaintEffectKind,
+    started_at: f32,
+    duration: f32,
+    intensity: f32,
+    thickness: Pixels,
+    feather: Pixels,
+    animation: Option<EffectAnimation>,
+}
+
+/// Creates an indeterminate ring spinner animated by the renderer clock.
+pub fn spinner_effect(
+    bounds: Bounds<Pixels>,
+    color: impl Into<Hsla>,
+    thickness: Pixels,
+) -> PaintEffect {
+    let color = color.into();
+    PaintEffect {
+        bounds,
+        corner_radii: (0.).into(),
+        color,
+        accent_color: color,
+        kind: PaintEffectKind::Spinner,
+        started_at: 0.0,
+        duration: SPINNER_PERIOD_SECONDS,
+        intensity: 1.0,
+        thickness: thickness.max(px(0.5)),
+        feather: px(1.0),
+        animation: Some(EffectAnimation {
+            frame_interval: EFFECT_MOTION_FRAME_INTERVAL,
+            ends_at: None,
+        }),
+    }
+}
+
+/// Creates a quiet, static line highlight rendered by the effect pipeline.
+pub fn line_highlight_effect(bounds: Bounds<Pixels>, color: impl Into<Hsla>) -> PaintEffect {
+    let color = color.into();
+    PaintEffect {
+        bounds,
+        corner_radii: (0.).into(),
+        color,
+        accent_color: color,
+        kind: PaintEffectKind::Highlight,
+        started_at: 0.0,
+        duration: 0.0,
+        intensity: 1.0,
+        thickness: px(0.0),
+        feather: px(1.0),
+        animation: None,
+    }
+}
+
+/// Creates a one-shot attention band. `phase` is its current normalized progress.
+pub fn attention_highlight_effect(
+    bounds: Bounds<Pixels>,
+    color: impl Into<Hsla>,
+    accent_color: impl Into<Hsla>,
+    phase: f32,
+) -> PaintEffect {
+    let phase = phase.clamp(0.0, 1.0);
+    let now = Instant::now();
+    let elapsed = ATTENTION_HIGHLIGHT_DURATION.mul_f32(phase);
+    let remaining = ATTENTION_HIGHLIGHT_DURATION.saturating_sub(elapsed);
+    PaintEffect {
+        bounds,
+        corner_radii: (0.).into(),
+        color: color.into(),
+        accent_color: accent_color.into(),
+        kind: PaintEffectKind::Highlight,
+        started_at: (effect_time_seconds() - ATTENTION_HIGHLIGHT_DURATION.as_secs_f32() * phase)
+            .rem_euclid(EFFECT_MOTION_TIME_WRAP_SECONDS),
+        duration: ATTENTION_HIGHLIGHT_DURATION.as_secs_f32(),
+        intensity: 1.0,
+        thickness: px(0.0),
+        feather: px(1.0),
+        animation: (!remaining.is_zero()).then_some(EffectAnimation {
+            frame_interval: EFFECT_MOTION_FRAME_INTERVAL,
+            ends_at: Some(now + remaining),
+        }),
+    }
+}
+
 impl PaintQuad {
     /// Sets the corner radii of the quad.
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
@@ -7014,7 +7214,9 @@ mod tests {
         TestAppContext, ThermalState, Window, WindowOptions, canvas, div, px, size,
     };
 
-    use super::frame_throttle_interval;
+    use super::{
+        EffectAnimation, Instant, MotionPresentationState, MotionSchedule, frame_throttle_interval,
+    };
 
     #[test]
     fn test_inactive_window_frame_policy() {
@@ -7284,5 +7486,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    #[test]
+    fn motion_presentations_keep_absolute_deadlines() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(33);
+        let mut schedule = MotionSchedule::default();
+        schedule.register(EffectAnimation {
+            frame_interval: interval,
+            ends_at: None,
+        });
+        let mut presentation = MotionPresentationState::default();
+        presentation.replace_schedule(&schedule, now);
+        let first_deadline = presentation.next_deadline.unwrap();
+
+        presentation.did_present(now + Duration::from_millis(10));
+        assert_eq!(presentation.next_deadline, Some(first_deadline));
+        presentation.replace_schedule(&schedule, now + Duration::from_millis(20));
+        assert_eq!(presentation.next_deadline, Some(first_deadline));
+        assert!(!presentation.presentation_due(now + Duration::from_millis(32)));
+        assert!(presentation.presentation_due(now + interval));
+
+        presentation.did_present(now + Duration::from_millis(105));
+        assert_eq!(
+            presentation.next_deadline,
+            Some(now + Duration::from_millis(132))
+        );
     }
 }

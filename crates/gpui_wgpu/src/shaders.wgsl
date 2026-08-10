@@ -80,7 +80,7 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    motion_time_seconds: f32,
 }
 
 struct GammaParams {
@@ -935,6 +935,100 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     }
 
     return blend_color(color, saturate(antialias_threshold - outer_sdf));
+}
+
+// --- procedural effects --- //
+
+struct EffectQuad {
+    order: u32,
+    kind: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    color: Hsla,
+    accent_color: Hsla,
+    corner_radii: Corners,
+    started_at: f32,
+    duration: f32,
+    intensity: f32,
+    thickness: f32,
+    feather: f32,
+    pad: f32,
+}
+@group(1) @binding(0) var<storage, read> b_effects: array<EffectQuad>;
+
+struct EffectVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) effect_id: u32,
+    @location(1) unit_position: vec2<f32>,
+    @location(2) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_effect(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32,
+) -> EffectVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let effect = b_effects[instance_id];
+
+    var out = EffectVarying();
+    out.position = to_device_position(unit_vertex, effect.bounds);
+    out.effect_id = instance_id;
+    out.unit_position = unit_vertex;
+    out.clip_distances = distance_from_clip_rect(
+        unit_vertex, effect.bounds, effect.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_effect(input: EffectVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let effect = b_effects[input.effect_id];
+    var color = hsla_to_rgba(effect.color);
+    var elapsed = globals.motion_time_seconds - effect.started_at;
+    if (elapsed < 0.0) {
+        elapsed += 4096.0;
+    }
+    if (effect.kind == 0u) {
+        let phase = fract(elapsed / max(effect.duration, 0.001));
+        let local = input.position.xy - effect.bounds.origin - effect.bounds.size * 0.5;
+        let radius = max(0.0, min(effect.bounds.size.x, effect.bounds.size.y) * 0.5
+            - effect.thickness * 0.5 - effect.feather);
+        let ring_distance = abs(length(local) - radius);
+        let ring_alpha = 1.0 - smoothstep(
+            effect.thickness * 0.5,
+            effect.thickness * 0.5 + max(effect.feather, 0.5),
+            ring_distance);
+        let angle = atan2(local.y, local.x) / (2.0 * M_PI_F) + 0.5;
+        let delta = (phase - angle + 1.0) % 1.0;
+        let arc_length = 0.78;
+        let arc_alpha = select(
+            0.0,
+            0.18 + 0.82 * (1.0 - delta / arc_length),
+            delta <= arc_length);
+        color.a *= ring_alpha * arc_alpha * effect.intensity;
+        return blend_color(color, 1.0);
+    }
+
+    if (effect.duration <= 0.0) {
+        color.a *= effect.intensity;
+        return blend_color(color, 1.0);
+    }
+
+    let phase = saturate(elapsed / effect.duration);
+    let accent = hsla_to_rgba(effect.accent_color);
+    let sweep_center = phase * 1.4 - 0.2;
+    let sweep_delta = (input.unit_position.x - sweep_center) / 0.16;
+    let sweep = exp(-sweep_delta * sweep_delta);
+    var decay = 1.0 - phase;
+    decay *= decay;
+    color = mix(color, accent, sweep);
+    color.a *= decay * (0.72 + 0.28 * sweep)
+        * effect.intensity;
+    return blend_color(color, 1.0);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
