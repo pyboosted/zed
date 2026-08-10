@@ -143,6 +143,8 @@ struct Background {
     solid: Hsla,
     gradient_angle_or_pattern_height: f32,
     colors: array<LinearColorStop, 2>,
+    pattern_origin_x: f32,
+    pattern_origin_y: f32,
     pad: u32,
 }
 
@@ -526,12 +528,17 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
                 0.0,
                 min(spacing.x, spacing.y)
             );
-            let relative_position = position - bounds.origin;
-            let cell_position = relative_position % spacing;
+            let pattern_origin = vec2<f32>(
+                background.pattern_origin_x,
+                background.pattern_origin_y
+            );
+            let grid_coordinate = (position - pattern_origin) / spacing;
+            let distance_to_line = abs(fract(grid_coordinate + vec2<f32>(0.5)) - vec2<f32>(0.5)) * spacing;
+            let half_line_width = line_width * 0.5;
             let line_coverage = vec2<f32>(1.0) - smoothstep(
-                vec2<f32>(line_width - 0.5),
-                vec2<f32>(line_width + 0.5),
-                cell_position
+                vec2<f32>(half_line_width - 0.5),
+                vec2<f32>(half_line_width + 0.5),
+                distance_to_line
             );
 
             background_color = solid_color;

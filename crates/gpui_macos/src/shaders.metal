@@ -1377,12 +1377,17 @@ float4 fill_color(Background background,
             0.0,
             min(spacing.x, spacing.y)
         );
-        float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
-        float2 cell_position = fmod(relative_position, spacing);
+        float2 pattern_origin = float2(
+            background.pattern_origin_x,
+            background.pattern_origin_y
+        );
+        float2 grid_coordinate = (position - pattern_origin) / spacing;
+        float2 distance_to_line = abs(fract(grid_coordinate + 0.5) - 0.5) * spacing;
+        float half_line_width = line_width * 0.5;
         float2 line_coverage = 1.0 - smoothstep(
-            float2(line_width - 0.5),
-            float2(line_width + 0.5),
-            cell_position
+            float2(half_line_width - 0.5),
+            float2(half_line_width + 0.5),
+            distance_to_line
         );
 
         color = solid_color;

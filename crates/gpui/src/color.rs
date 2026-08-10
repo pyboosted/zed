@@ -783,6 +783,8 @@ pub struct Background {
     pub(crate) solid: Hsla,
     pub(crate) gradient_angle_or_pattern_height: f32,
     pub(crate) colors: [LinearColorStop; 2],
+    pub(crate) pattern_origin_x: f32,
+    pub(crate) pattern_origin_y: f32,
     /// Padding for alignment for repr(C) layout.
     pad: u32,
 }
@@ -808,12 +810,14 @@ impl std::fmt::Debug for Background {
             ),
             BackgroundTag::Grid => write!(
                 f,
-                "Grid({:?}, {:?}, {}, {}, {})",
+                "Grid({:?}, {:?}, {}, {}, {}, {}, {})",
                 self.solid,
                 self.colors[0].color,
                 self.gradient_angle_or_pattern_height,
                 self.colors[1].percentage,
-                self.colors[0].percentage
+                self.colors[0].percentage,
+                self.pattern_origin_x,
+                self.pattern_origin_y
             ),
         }
     }
@@ -828,6 +832,8 @@ impl Default for Background {
             color_space: ColorSpace::default(),
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(), LinearColorStop::default()],
+            pattern_origin_x: 0.0,
+            pattern_origin_y: 0.0,
             pad: 0,
         }
     }
@@ -859,14 +865,16 @@ pub fn checkerboard(color: impl Into<Hsla>, size: f32) -> Background {
 
 /// Creates a grid pattern background.
 ///
-/// Pattern coordinates are relative to the painted bounds, allowing callers
-/// to control the grid phase by shifting those bounds while clipping the quad.
+/// Spacing, line width, and origin use the same coordinate system as the
+/// rendered quad. The origin is the center of a grid-line intersection.
 pub fn grid_pattern(
     background_color: impl Into<Hsla>,
     line_color: impl Into<Hsla>,
     column_spacing: f32,
     row_spacing: f32,
     line_width: f32,
+    column_origin: f32,
+    row_origin: f32,
 ) -> Background {
     Background {
         tag: BackgroundTag::Grid,
@@ -882,6 +890,8 @@ pub fn grid_pattern(
                 ..Default::default()
             },
         ],
+        pattern_origin_x: column_origin,
+        pattern_origin_y: row_origin,
         ..Default::default()
     }
 }
@@ -1089,7 +1099,7 @@ mod tests {
     fn test_background_grid_pattern() {
         let background_color = Hsla::from(rgba(0x08111e60));
         let line_color = Hsla::from(rgba(0x314b7488));
-        let background = grid_pattern(background_color, line_color, 18.0, 24.0, 1.0);
+        let background = grid_pattern(background_color, line_color, 18.0, 24.0, 1.0, 7.5, 9.5);
 
         assert_eq!(background.tag, BackgroundTag::Grid);
         assert_eq!(background.solid, background_color);
@@ -1097,6 +1107,8 @@ mod tests {
         assert_eq!(background.gradient_angle_or_pattern_height, 18.0);
         assert_eq!(background.colors[1].percentage, 24.0);
         assert_eq!(background.colors[0].percentage, 1.0);
+        assert_eq!(background.pattern_origin_x, 7.5);
+        assert_eq!(background.pattern_origin_y, 9.5);
         assert!(!background.is_transparent());
         assert!(background.opacity(0.0).is_transparent());
     }

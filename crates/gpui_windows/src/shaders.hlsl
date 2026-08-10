@@ -72,6 +72,8 @@ struct Background {
     Hsla solid;
     float gradient_angle_or_pattern_height;
     LinearColorStop colors[2];
+    float pattern_origin_x;
+    float pattern_origin_y;
     uint pad;
 };
 
@@ -472,12 +474,17 @@ float4 gradient_color(Background background,
                 0.0,
                 min(spacing.x, spacing.y)
             );
-            float2 relative_position = position - bounds.origin;
-            float2 cell_position = fmod(relative_position, spacing);
+            float2 pattern_origin = float2(
+                background.pattern_origin_x,
+                background.pattern_origin_y
+            );
+            float2 grid_coordinate = (position - pattern_origin) / spacing;
+            float2 distance_to_line = abs(frac(grid_coordinate + 0.5) - 0.5) * spacing;
+            float half_line_width = line_width * 0.5;
             float2 line_coverage = 1.0 - smoothstep(
-                line_width - 0.5,
-                line_width + 0.5,
-                cell_position
+                half_line_width - 0.5,
+                half_line_width + 0.5,
+                distance_to_line
             );
 
             color = solid_color;
