@@ -1773,7 +1773,8 @@ impl Window {
                     || motion_due
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
-                if invalidator.is_dirty() || force_render {
+                let preparation_start = profiler::frame_trace_enabled().then(Instant::now);
+                let presentation_kind = if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1787,11 +1788,27 @@ impl Window {
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
-                    })
+                    });
+                    Some(profiler::PresentationKind::Drawn)
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
+                    Some(profiler::PresentationKind::Retained)
+                } else {
+                    None
+                };
+
+                if let (Some(preparation_start), Some(kind)) =
+                    (preparation_start, presentation_kind)
+                {
+                    profiler::record_presentation_timing(profiler::PresentationTiming {
+                        window_id: handle.window_id(),
+                        kind,
+                        motion_requested: motion_due,
+                        preparation_start,
+                        preparation_end: Instant::now(),
+                    });
                 }
 
                 handle
@@ -7078,6 +7095,25 @@ pub fn spinner_effect(
     }
 }
 
+/// Creates a point-in-time spinner without registering retained motion.
+///
+/// Callers that deliberately drive animation from CPU invalidation can repaint
+/// this effect with a normalized `phase`. Ordinary product spinners should use
+/// [`spinner_effect`] so GPUI can present the retained scene directly.
+pub fn spinner_effect_at_phase(
+    bounds: Bounds<Pixels>,
+    color: impl Into<Hsla>,
+    thickness: Pixels,
+    phase: f32,
+) -> PaintEffect {
+    let mut effect = spinner_effect(bounds, color, thickness);
+    let phase = phase.rem_euclid(1.0);
+    effect.started_at = (effect_time_seconds() - SPINNER_PERIOD_SECONDS * phase)
+        .rem_euclid(EFFECT_MOTION_TIME_WRAP_SECONDS);
+    effect.animation = None;
+    effect
+}
+
 /// Creates a quiet, static line highlight rendered by the effect pipeline.
 pub fn line_highlight_effect(bounds: Bounds<Pixels>, color: impl Into<Hsla>) -> PaintEffect {
     let color = color.into();
@@ -7220,7 +7256,8 @@ mod tests {
     use super::{
         ATTENTION_HIGHLIGHT_DURATION, EFFECT_MOTION_FRAME_INTERVAL,
         EFFECT_MOTION_TIME_WRAP_SECONDS, EffectAnimation, Instant, MotionPresentationState,
-        MotionSchedule, SPINNER_PERIOD_SECONDS, frame_throttle_interval,
+        MotionSchedule, SPINNER_PERIOD_SECONDS, frame_throttle_interval, spinner_effect,
+        spinner_effect_at_phase,
     };
 
     #[test]
@@ -7533,5 +7570,17 @@ mod tests {
             );
         }
         assert!(EFFECT_MOTION_FRAME_INTERVAL >= Duration::from_secs_f64(1.0 / 30.0));
+    }
+
+    #[test]
+    fn point_in_time_spinner_does_not_register_retained_motion() {
+        let bounds = Bounds::default();
+        let animated = spinner_effect(bounds, crate::white(), px(1.25));
+        let point_in_time = spinner_effect_at_phase(bounds, crate::white(), px(1.25), 2.25);
+
+        assert!(animated.animation.is_some());
+        assert!(point_in_time.animation.is_none());
+        assert!(point_in_time.started_at >= 0.0);
+        assert!(point_in_time.started_at < EFFECT_MOTION_TIME_WRAP_SECONDS);
     }
 }

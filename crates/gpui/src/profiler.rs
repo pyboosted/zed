@@ -712,6 +712,37 @@ pub struct FrameTiming {
     pub draw_end: Instant,
 }
 
+/// Whether a presented frame rebuilt the retained scene first.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PresentationKind {
+    /// The window ran `Window::draw` before presenting.
+    Drawn,
+    /// The window presented its previously drawn scene without rebuilding it.
+    Retained,
+}
+
+/// CPU preparation timing for one window presentation.
+#[derive(Debug, Copy, Clone)]
+pub struct PresentationTiming {
+    /// The window that was presented.
+    pub window_id: WindowId,
+    /// Whether this presentation rebuilt or reused the retained scene.
+    pub kind: PresentationKind,
+    /// Whether a retained motion deadline requested this presentation.
+    pub motion_requested: bool,
+    /// When frame preparation started on the window thread.
+    pub preparation_start: Instant,
+    /// When drawing/submission returned on the window thread.
+    pub preparation_end: Instant,
+}
+
+impl PresentationTiming {
+    /// CPU time spent preparing and submitting this presentation.
+    pub fn preparation_duration(&self) -> Duration {
+        self.preparation_end.duration_since(self.preparation_start)
+    }
+}
+
 impl FrameTiming {
     /// Time spent inside `Window::draw`.
     pub fn draw_duration(&self) -> Duration {
@@ -739,6 +770,20 @@ static FRAME_TIMINGS: spin::Mutex<FrameTimings> = spin::Mutex::new(FrameTimings 
     total_pushed: 0,
 });
 
+const MAX_PRESENTATION_TIMINGS: usize =
+    (16 * 1024 * 1024) / core::mem::size_of::<PresentationTiming>();
+
+struct PresentationTimings {
+    timings: VecDeque<PresentationTiming>,
+    total_pushed: u64,
+}
+
+static PRESENTATION_TIMINGS: spin::Mutex<PresentationTimings> =
+    spin::Mutex::new(PresentationTimings {
+        timings: VecDeque::new(),
+        total_pushed: 0,
+    });
+
 static FRAME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enables or disables frame timing collection at runtime.
@@ -756,6 +801,10 @@ pub fn set_frame_trace_enabled(enabled: bool) -> bool {
         frames.timings.clear();
         frames.timings.shrink_to_fit();
         frames.total_pushed = 0;
+        let mut presentations = PRESENTATION_TIMINGS.lock();
+        presentations.timings.clear();
+        presentations.timings.shrink_to_fit();
+        presentations.total_pushed = 0;
     }
     true
 }
@@ -780,6 +829,23 @@ pub fn record_frame_timing(timing: FrameTiming) {
     }
     frames.timings.push_back(timing);
     frames.total_pushed += 1;
+}
+
+/// Records the CPU preparation time of a presented window frame.
+///
+/// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
+pub fn record_presentation_timing(timing: PresentationTiming) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+
+    let mut presentations = PRESENTATION_TIMINGS.lock();
+    if presentations.timings.len() >= MAX_PRESENTATION_TIMINGS {
+        presentations.timings.pop_front();
+    }
+    presentations.timings.push_back(timing);
+    presentations.total_pushed += 1;
 }
 
 /// Drains frame timings recorded after this collector was created, tracking a
@@ -817,6 +883,42 @@ impl FrameTimingCollector {
             .copied()
             .collect();
         self.cursor = frames.total_pushed;
+        unseen
+    }
+}
+
+/// Collects presentation timings recorded after the collector was created.
+pub struct PresentationTimingCollector {
+    cursor: u64,
+}
+
+impl Default for PresentationTimingCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PresentationTimingCollector {
+    /// Creates a collector that only sees presentations recorded from this point on.
+    pub fn new() -> Self {
+        Self {
+            cursor: PRESENTATION_TIMINGS.lock().total_pushed,
+        }
+    }
+
+    /// Returns presentation timings recorded since the previous call.
+    pub fn collect_unseen(&mut self) -> Vec<PresentationTiming> {
+        let presentations = PRESENTATION_TIMINGS.lock();
+        let buffer_len = presentations.timings.len() as u64;
+        let buffer_start = presentations.total_pushed.saturating_sub(buffer_len);
+        let skip = self.cursor.saturating_sub(buffer_start) as usize;
+        let unseen = presentations
+            .timings
+            .iter()
+            .skip(skip.min(presentations.timings.len()))
+            .copied()
+            .collect();
+        self.cursor = presentations.total_pushed;
         unseen
     }
 }
