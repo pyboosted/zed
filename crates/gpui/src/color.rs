@@ -747,6 +747,7 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    Grid = 4,
 }
 
 /// A color space for color interpolation.
@@ -805,6 +806,15 @@ impl std::fmt::Debug for Background {
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
             ),
+            BackgroundTag::Grid => write!(
+                f,
+                "Grid({:?}, {:?}, {}, {}, {})",
+                self.solid,
+                self.colors[0].color,
+                self.gradient_angle_or_pattern_height,
+                self.colors[1].percentage,
+                self.colors[0].percentage
+            ),
         }
     }
 }
@@ -843,6 +853,35 @@ pub fn checkerboard(color: impl Into<Hsla>, size: f32) -> Background {
         tag: BackgroundTag::Checkerboard,
         solid: color.into(),
         gradient_angle_or_pattern_height: size,
+        ..Default::default()
+    }
+}
+
+/// Creates a grid pattern background.
+///
+/// Pattern coordinates are relative to the painted bounds, allowing callers
+/// to control the grid phase by shifting those bounds while clipping the quad.
+pub fn grid_pattern(
+    background_color: impl Into<Hsla>,
+    line_color: impl Into<Hsla>,
+    column_spacing: f32,
+    row_spacing: f32,
+    line_width: f32,
+) -> Background {
+    Background {
+        tag: BackgroundTag::Grid,
+        solid: background_color.into(),
+        gradient_angle_or_pattern_height: column_spacing.max(1.0),
+        colors: [
+            LinearColorStop {
+                color: line_color.into(),
+                percentage: line_width.max(0.0),
+            },
+            LinearColorStop {
+                percentage: row_spacing.max(1.0),
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     }
 }
@@ -943,6 +982,9 @@ impl Background {
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
+            BackgroundTag::Grid => {
+                self.solid.is_transparent() && self.colors[0].color.is_transparent()
+            }
         }
     }
 }
@@ -1039,6 +1081,22 @@ mod tests {
 
         assert_eq!(background.opacity(0.5).colors[0], from.opacity(0.5));
         assert_eq!(background.opacity(0.5).colors[1], to.opacity(0.5));
+        assert!(!background.is_transparent());
+        assert!(background.opacity(0.0).is_transparent());
+    }
+
+    #[test]
+    fn test_background_grid_pattern() {
+        let background_color = Hsla::from(rgba(0x08111e60));
+        let line_color = Hsla::from(rgba(0x314b7488));
+        let background = grid_pattern(background_color, line_color, 18.0, 24.0, 1.0);
+
+        assert_eq!(background.tag, BackgroundTag::Grid);
+        assert_eq!(background.solid, background_color);
+        assert_eq!(background.colors[0].color, line_color);
+        assert_eq!(background.gradient_angle_or_pattern_height, 18.0);
+        assert_eq!(background.colors[1].percentage, 24.0);
+        assert_eq!(background.colors[0].percentage, 1.0);
         assert!(!background.is_transparent());
         assert!(background.opacity(0.0).is_transparent());
     }

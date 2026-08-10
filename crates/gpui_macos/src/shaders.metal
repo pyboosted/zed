@@ -1243,6 +1243,9 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid,
   GradientColor out;
   if (tag == 0 || tag == 2 || tag == 3) {
     out.solid = hsla_to_rgba(solid);
+  } else if (tag == 4) {
+    out.solid = hsla_to_rgba(solid);
+    out.color0 = hsla_to_rgba(color0);
   } else if (tag == 1) {
     out.color0 = hsla_to_rgba(color0);
     out.color1 = hsla_to_rgba(color1);
@@ -1359,6 +1362,40 @@ float4 fill_color(Background background,
 
         color = solid_color;
         color.a *= saturate(should_be_colored);
+        break;
+    }
+    case 4: {
+        float2 spacing = max(
+            float2(
+                background.gradient_angle_or_pattern_height,
+                background.colors[1].percentage
+            ),
+            float2(1.0)
+        );
+        float line_width = clamp(
+            background.colors[0].percentage,
+            0.0,
+            min(spacing.x, spacing.y)
+        );
+        float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
+        float2 cell_position = fmod(relative_position, spacing);
+        float2 line_coverage = 1.0 - smoothstep(
+            float2(line_width - 0.5),
+            float2(line_width + 0.5),
+            cell_position
+        );
+
+        color = solid_color;
+        if (line_coverage.x > 0.0) {
+            float4 vertical_line = color0;
+            vertical_line.a *= line_coverage.x;
+            color = over(color, vertical_line);
+        }
+        if (line_coverage.y > 0.0) {
+            float4 horizontal_line = color0;
+            horizontal_line.a *= line_coverage.y;
+            color = over(color, horizontal_line);
+        }
         break;
     }
   }

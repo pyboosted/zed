@@ -135,6 +135,7 @@ struct Background {
     // 1u is LinearGradient
     // 2u is PatternSlash
     // 3u is Checkerboard
+    // 4u is Grid
     tag: u32,
     // 0u is sRGB linear color
     // 1u is Oklab color
@@ -407,6 +408,9 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
 
     if (tag == 0u || tag == 2u || tag == 3u) {
         result.solid = hsla_to_rgba(solid);
+    } else if (tag == 4u) {
+        result.solid = hsla_to_rgba(solid);
+        result.color0 = hsla_to_rgba(colors[0].color);
     } else if (tag == 1u) {
         // The hsla_to_rgba is returns a linear sRGB color
         result.color0 = hsla_to_rgba(colors[0].color);
@@ -508,6 +512,39 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
             background_color = solid_color;
             background_color.a *= saturate(should_be_colored);
+        }
+        case 4u: {
+            let spacing = max(
+                vec2<f32>(
+                    background.gradient_angle_or_pattern_height,
+                    background.colors[1].percentage
+                ),
+                vec2<f32>(1.0)
+            );
+            let line_width = clamp(
+                background.colors[0].percentage,
+                0.0,
+                min(spacing.x, spacing.y)
+            );
+            let relative_position = position - bounds.origin;
+            let cell_position = relative_position % spacing;
+            let line_coverage = vec2<f32>(1.0) - smoothstep(
+                vec2<f32>(line_width - 0.5),
+                vec2<f32>(line_width + 0.5),
+                cell_position
+            );
+
+            background_color = solid_color;
+            if (line_coverage.x > 0.0) {
+                var vertical_line = color0;
+                vertical_line.a *= line_coverage.x;
+                background_color = over(background_color, vertical_line);
+            }
+            if (line_coverage.y > 0.0) {
+                var horizontal_line = color0;
+                horizontal_line.a *= line_coverage.y;
+                background_color = over(background_color, horizontal_line);
+            }
         }
     }
 
