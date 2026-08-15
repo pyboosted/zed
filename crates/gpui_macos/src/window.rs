@@ -1506,6 +1506,13 @@ impl PlatformWindow for MacWindow {
         false
     }
 
+    fn set_ignores_mouse_events(&self, ignores_mouse_events: bool) {
+        unsafe {
+            let window = self.0.lock().native_window;
+            let _: () = msg_send![window, setIgnoresMouseEvents: ignores_mouse_events as BOOL];
+        }
+    }
+
     fn set_title(&mut self, title: &str) {
         unsafe {
             let app = NSApplication::sharedApplication(nil);

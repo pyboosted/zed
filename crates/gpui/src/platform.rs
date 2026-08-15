@@ -823,6 +823,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
     fn is_hovered(&self) -> bool;
+    fn set_ignores_mouse_events(&self, _ignores_mouse_events: bool) {}
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);

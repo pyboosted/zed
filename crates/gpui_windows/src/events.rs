@@ -87,6 +87,31 @@ fn complete_size_move_loop(
     Some(0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HitTestGate {
+    Passthrough,
+    Fullscreen,
+    Proceed,
+}
+
+fn hit_test_gate(ignores_mouse_events: bool, is_fullscreen: bool) -> HitTestGate {
+    if ignores_mouse_events {
+        HitTestGate::Passthrough
+    } else if is_fullscreen {
+        HitTestGate::Fullscreen
+    } else {
+        HitTestGate::Proceed
+    }
+}
+
+#[inline]
+fn transparent_hit_test_result() -> isize {
+    // HTTRANSPARENT is the one signed hit-test constant (i32 = -1); the
+    // WM_NCHITTEST LRESULT must carry the sign-extended form, matching the
+    // production-proven subclass path this API replaces.
+    HTTRANSPARENT as isize
+}
+
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
 /// because the coordination is inherently cross-window: while window A is
@@ -1099,8 +1124,13 @@ impl WindowsWindowInner {
     }
 
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
-        if self.state.is_fullscreen() {
-            return None;
+        match hit_test_gate(
+            self.state.ignores_mouse_events.get(),
+            self.state.is_fullscreen(),
+        ) {
+            HitTestGate::Passthrough => return Some(transparent_hit_test_result()),
+            HitTestGate::Fullscreen => return None,
+            HitTestGate::Proceed => {}
         }
 
         let callback = self.state.callbacks.hit_test_window_control.take();
@@ -1571,12 +1601,32 @@ impl WindowsWindowInner {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResampleAction, SIZE_MOVE_LOOP_TIMER_ID, SIZE_MOVE_SETTLE_TIMER_ID, TimerAction,
-        complete_size_move_loop, resample_action, timer_action,
+        HitTestGate, ResampleAction, SIZE_MOVE_LOOP_TIMER_ID, SIZE_MOVE_SETTLE_TIMER_ID,
+        TimerAction, complete_size_move_loop, hit_test_gate, resample_action, timer_action,
+        transparent_hit_test_result,
     };
     use gpui::{px, size};
     use std::cell::Cell;
     use windows::Win32::UI::WindowsAndMessaging::{WM_EXITMENULOOP, WM_EXITSIZEMOVE};
+
+    #[test]
+    fn mouse_passthrough_hit_test_toggles_mid_session() {
+        assert_eq!(hit_test_gate(true, true), HitTestGate::Passthrough);
+        assert_eq!(hit_test_gate(false, true), HitTestGate::Fullscreen);
+        assert_eq!(hit_test_gate(false, false), HitTestGate::Proceed);
+        assert_eq!(hit_test_gate(true, false), HitTestGate::Passthrough);
+        assert_eq!(transparent_hit_test_result(), -1isize);
+
+        let ignores_mouse_events = Cell::new(false);
+        let next_gate = || hit_test_gate(ignores_mouse_events.get(), false);
+        assert_eq!(next_gate(), HitTestGate::Proceed);
+
+        ignores_mouse_events.set(true);
+        assert_eq!(next_gate(), HitTestGate::Passthrough);
+
+        ignores_mouse_events.set(false);
+        assert_eq!(next_gate(), HitTestGate::Proceed);
+    }
 
     #[test]
     fn resample_action_covers_size_scale_and_force_render_changes() {

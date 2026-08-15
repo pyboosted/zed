@@ -61,6 +61,7 @@ pub struct WindowsWindowState {
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
     pub(crate) start_window_move_posted: Cell<bool>,
+    pub(crate) ignores_mouse_events: Cell<bool>,
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<DirectXRenderer>,
@@ -197,6 +198,7 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             start_window_move_posted: Cell::new(false),
+            ignores_mouse_events: Cell::new(false),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
             click_state,
@@ -885,6 +887,32 @@ impl PlatformWindow for WindowsWindow {
 
     fn is_hovered(&self) -> bool {
         self.state.hovered.get()
+    }
+
+    fn set_ignores_mouse_events(&self, ignores_mouse_events: bool) {
+        self.state.ignores_mouse_events.set(ignores_mouse_events);
+
+        let mut extended_style =
+            WINDOW_EX_STYLE(unsafe { get_window_long(self.0.hwnd, GWL_EXSTYLE) } as _);
+        if ignores_mouse_events {
+            extended_style |= WS_EX_TRANSPARENT;
+        } else {
+            extended_style &= !WS_EX_TRANSPARENT;
+        }
+
+        unsafe {
+            set_window_long(self.0.hwnd, GWL_EXSTYLE, extended_style.0 as isize);
+            SetWindowPos(
+                self.0.hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .log_err();
+        }
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {

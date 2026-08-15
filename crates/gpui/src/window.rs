@@ -2954,6 +2954,20 @@ impl Window {
         }
     }
 
+    /// Sets whether mouse events pass through this window to windows underneath it.
+    ///
+    /// Mouse-passthrough drag overlays should generally use
+    /// [`InactiveWindowFramePolicy::MatchDisplay`] so they continue rendering at display cadence
+    /// while inactive.
+    ///
+    /// Do not combine this API with an application-side window-procedure subclass that overrides
+    /// `WM_NCHITTEST` on the same window. When adopting this API for a window, remove any such
+    /// subclass in the same change.
+    pub fn set_ignores_mouse_events(&self, ignores_mouse_events: bool) {
+        self.platform_window
+            .set_ignores_mouse_events(ignores_mouse_events);
+    }
+
     /// Toggle zoom on the window.
     pub fn zoom_window(&self) {
         self.platform_window.zoom();
