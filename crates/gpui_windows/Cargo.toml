@@ -15,6 +15,8 @@ path = "src/gpui_windows.rs"
 default = ["gpui/default"]
 test-support = ["gpui/test-support"]
 screen-capture = ["gpui/screen-capture", "scap"]
+# Compiles bundled HLSL at runtime; requires d3dcompiler_47.dll (included with Windows 8.1 and later).
+runtime-shader-compile = []
 
 [dependencies]
 gpui.workspace = true

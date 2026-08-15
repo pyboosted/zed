@@ -1817,7 +1817,10 @@ const BUFFER_COUNT: usize = 3;
 pub(crate) mod shader_resources {
     use anyhow::Result;
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "runtime-shader-compile")]
+    use std::sync::OnceLock;
+
+    #[cfg(all(debug_assertions, not(feature = "runtime-shader-compile")))]
     use windows::{
         Win32::Graphics::Direct3D::{
             Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
@@ -1826,8 +1829,33 @@ pub(crate) mod shader_resources {
         core::{HSTRING, PCSTR},
     };
 
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    pub(crate) enum ShaderModule {
+    #[cfg(feature = "runtime-shader-compile")]
+    use windows::{
+        Win32::Graphics::Direct3D::{
+            Fxc::{
+                D3DCOMPILE_DEBUG, D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile,
+            },
+            ID3DBlob,
+        },
+        core::PCSTR,
+    };
+
+    macro_rules! shader_modules {
+        ($count:expr; $($module:ident),+ $(,)?) => {
+            #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+            pub(crate) enum ShaderModule {
+                $($module),+
+            }
+
+            impl ShaderModule {
+                #[allow(dead_code)]
+                pub(crate) const ALL: [Self; $count] = [$(Self::$module),+];
+            }
+        };
+    }
+
+    shader_modules!(10;
         Quad,
         Effect,
         Shadow,
@@ -1838,7 +1866,7 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
-    }
+    );
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderTarget {
@@ -1846,6 +1874,7 @@ pub(crate) mod shader_resources {
         Fragment,
     }
 
+    #[cfg(not(feature = "runtime-shader-compile"))]
     pub(crate) struct RawShaderBytes<'t> {
         inner: &'t [u8],
 
@@ -1853,6 +1882,7 @@ pub(crate) mod shader_resources {
         _blob: ID3DBlob,
     }
 
+    #[cfg(not(feature = "runtime-shader-compile"))]
     impl<'t> RawShaderBytes<'t> {
         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
             #[cfg(not(debug_assertions))]
@@ -1924,7 +1954,106 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "runtime-shader-compile")]
+    pub(crate) struct RawShaderBytes {
+        bytes: &'static [u8],
+    }
+
+    #[cfg(feature = "runtime-shader-compile")]
+    impl RawShaderBytes {
+        pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
+            Ok(Self {
+                bytes: cached_shader_bytes(module, target)?,
+            })
+        }
+
+        pub(crate) fn as_bytes(&self) -> &[u8] {
+            self.bytes
+        }
+    }
+
+    #[cfg(feature = "runtime-shader-compile")]
+    fn cached_shader_bytes(module: ShaderModule, target: ShaderTarget) -> Result<&'static [u8]> {
+        let caches = match module {
+            ShaderModule::Quad => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::Effect => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::Shadow => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::Underline => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::PathRasterization => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::PathSprite => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::MonochromeSprite => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::SubpixelSprite => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::PolychromeSprite => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+            ShaderModule::EmojiRasterization => {
+                static CACHES: [OnceLock<Box<[u8]>>; 2] =
+                    [const { OnceLock::new() }, const { OnceLock::new() }];
+                &CACHES
+            }
+        };
+        let cache = match target {
+            ShaderTarget::Vertex => &caches[0],
+            ShaderTarget::Fragment => &caches[1],
+        };
+
+        if let Some(bytes) = cache.get() {
+            return Ok(bytes.as_ref());
+        }
+
+        let blob = build_shader_blob(module, target)?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        }
+        .to_vec()
+        .into_boxed_slice();
+        match cache.set(bytes) {
+            Ok(()) => {}
+            Err(_bytes) => {
+                // Another renderer thread populated this cache while the shader was compiling.
+            }
+        }
+        cache
+            .get()
+            .map(|bytes| bytes.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("shader bytecode was not cached"))
+    }
+
+    #[cfg(all(debug_assertions, not(feature = "runtime-shader-compile")))]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
         unsafe {
             use windows::Win32::Graphics::{
@@ -1990,10 +2119,79 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(feature = "runtime-shader-compile")]
+    pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+        unsafe {
+            let source = match entry {
+                ShaderModule::Quad
+                | ShaderModule::Effect
+                | ShaderModule::Shadow
+                | ShaderModule::Underline
+                | ShaderModule::PathRasterization
+                | ShaderModule::PathSprite
+                | ShaderModule::MonochromeSprite
+                | ShaderModule::SubpixelSprite
+                | ShaderModule::PolychromeSprite => shader_source(
+                    include_str!("alpha_correction.hlsl"),
+                    include_str!("shaders.hlsl"),
+                ),
+                ShaderModule::EmojiRasterization => shader_source(
+                    include_str!("alpha_correction.hlsl"),
+                    include_str!("color_text_raster.hlsl"),
+                ),
+            };
+
+            let entry = format!(
+                "{}_{}\0",
+                entry.as_str(),
+                match target {
+                    ShaderTarget::Vertex => "vertex",
+                    ShaderTarget::Fragment => "fragment",
+                }
+            );
+            let target = match target {
+                ShaderTarget::Vertex => "vs_4_1\0",
+                ShaderTarget::Fragment => "ps_4_1\0",
+            };
+            let compile_flags = if cfg!(debug_assertions) {
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+            } else {
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3
+            };
+
+            let mut compile_blob = None;
+            let mut error_blob = None;
+            let result = D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                PCSTR::null(),
+                None,
+                None,
+                PCSTR::from_raw(entry.as_ptr()),
+                PCSTR::from_raw(target.as_ptr()),
+                compile_flags,
+                0,
+                &mut compile_blob,
+                Some(&mut error_blob),
+            );
+            if result.is_err() {
+                let Some(error_blob) = error_blob else {
+                    return Err(anyhow::anyhow!("{result:?}"));
+                };
+                let error_string =
+                    std::ffi::CStr::from_ptr(error_blob.GetBufferPointer().cast::<i8>())
+                        .to_string_lossy();
+                log::error!("Shader compile error: {}", error_string);
+                return Err(anyhow::anyhow!("Compile error: {}", error_string));
+            }
+            compile_blob.ok_or_else(|| anyhow::anyhow!("shader compilation returned no bytecode"))
+        }
+    }
+
+    #[cfg(all(not(debug_assertions), not(feature = "runtime-shader-compile")))]
     include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "runtime-shader-compile"))]
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
@@ -2008,6 +2206,32 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
+        }
+    }
+
+    #[cfg(feature = "runtime-shader-compile")]
+    fn shader_source(alpha_correction: &str, source: &str) -> String {
+        let body = source
+            .lines()
+            .skip_while(|line| line.trim_start().starts_with("#include"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{alpha_correction}\n{body}")
+    }
+
+    #[cfg(all(test, feature = "runtime-shader-compile"))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn runtime_compiles_every_shader_module() -> Result<()> {
+            for module in ShaderModule::ALL {
+                for target in [ShaderTarget::Vertex, ShaderTarget::Fragment] {
+                    let shader = RawShaderBytes::new(module, target)?;
+                    assert!(!shader.as_bytes().is_empty(), "{module:?} {target:?}");
+                }
+            }
+            Ok(())
         }
     }
 }
