@@ -30,6 +30,61 @@ pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+const SIZE_MOVE_SETTLE_TIMER_ID: usize = 2;
+const SIZE_MOVE_SETTLE_DELAY_MS: u32 = 50;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResampleAction {
+    NotifyResize { scale_changed: bool },
+    RenderOnly,
+    Skip,
+}
+
+fn resample_action(
+    previous_logical_size: Size<Pixels>,
+    previous_scale_factor: f32,
+    new_logical_size: Size<Pixels>,
+    new_scale_factor: f32,
+    force_render: bool,
+) -> ResampleAction {
+    let scale_changed = previous_scale_factor != new_scale_factor;
+    if previous_logical_size != new_logical_size || scale_changed {
+        ResampleAction::NotifyResize { scale_changed }
+    } else if force_render {
+        ResampleAction::RenderOnly
+    } else {
+        ResampleAction::Skip
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerAction {
+    SizeMoveLoopPaint,
+    SettleResample,
+    None,
+}
+
+fn timer_action(timer_id: usize) -> TimerAction {
+    match timer_id {
+        SIZE_MOVE_LOOP_TIMER_ID => TimerAction::SizeMoveLoopPaint,
+        SIZE_MOVE_SETTLE_TIMER_ID => TimerAction::SettleResample,
+        _ => TimerAction::None,
+    }
+}
+
+fn complete_size_move_loop(
+    message: u32,
+    force_resample: impl FnOnce(),
+    arm_settle_recheck: impl FnOnce(),
+) -> Option<isize> {
+    if !matches!(message, WM_EXITSIZEMOVE | WM_EXITMENULOOP) {
+        return None;
+    }
+
+    force_resample();
+    arm_settle_recheck();
+    Some(0)
+}
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
@@ -65,6 +120,10 @@ impl DrawCoordinator {
             Some(DrawWindowGuard { coordinator: self })
         }
     }
+
+    fn is_drawing(&self) -> bool {
+        self.drawing.get()
+    }
 }
 
 struct DrawWindowGuard<'a> {
@@ -97,7 +156,7 @@ impl WindowsWindowInner {
             WM_SIZE => self.handle_size_msg(wparam, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
             WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
-            WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
+            WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle, msg),
             WM_TIMER => self.handle_timer_msg(handle, wparam),
             WM_NCCALCSIZE => self.handle_calc_client_size(handle, wparam, lparam),
             WM_DPICHANGED => self.handle_dpi_changed_msg(handle, wparam, lparam),
@@ -269,6 +328,82 @@ impl WindowsWindowInner {
         }
     }
 
+    fn sync_client_rect_size(&self, handle: HWND, force_render: bool) {
+        if self.state.draw_coordinator.is_drawing() {
+            log::debug!("deferring re-entrant client-rect resample of window {handle:?}");
+            if force_render {
+                self.state.force_render_pending.set(true);
+            }
+            // Re-arm the settle timer so the deferred sample is retried once
+            // the in-progress draw unwinds; SetTimer on the same (HWND, id)
+            // replaces any outstanding timer, so this cannot accumulate.
+            unsafe {
+                let ret = SetTimer(
+                    Some(handle),
+                    SIZE_MOVE_SETTLE_TIMER_ID,
+                    SIZE_MOVE_SETTLE_DELAY_MS,
+                    None,
+                );
+                if ret == 0 {
+                    log::error!(
+                        "unable to re-arm settle timer for deferred resample: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+            return;
+        }
+
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(handle, &mut rect) }.is_err() {
+            return;
+        }
+
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        let previous_logical_size = self.state.logical_size.get();
+        let previous_scale_factor = self.state.scale_factor.get();
+        let dpi = unsafe { GetDpiForWindow(handle) };
+        let scale_factor = if dpi == 0 {
+            previous_scale_factor
+        } else {
+            dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32
+        };
+        let device_size = size(DevicePixels(width), DevicePixels(height));
+        let new_logical_size = device_size.to_pixels(scale_factor);
+        let action = resample_action(
+            previous_logical_size,
+            previous_scale_factor,
+            new_logical_size,
+            scale_factor,
+            force_render,
+        );
+
+        match action {
+            ResampleAction::NotifyResize { scale_changed } => {
+                if scale_changed {
+                    self.state.scale_factor.set(scale_factor);
+                    self.state.border_offset.update(handle).log_err();
+                    self.state
+                        .direct_manipulation
+                        .set_scale_factor(scale_factor);
+                }
+                self.handle_size_change(device_size, scale_factor, true);
+            }
+            ResampleAction::RenderOnly => {
+                if let Err(error) = self.state.renderer.borrow_mut().resize(device_size) {
+                    log::error!("Failed to resize renderer, invalidating devices: {}", error);
+                    self.state.invalidate_devices.store(true, Ordering::Release);
+                }
+            }
+            ResampleAction::Skip => {}
+        }
+
+        if force_render {
+            let _ = self.draw_window(handle, true);
+        }
+    }
+
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
         unsafe {
             let ret = SetTimer(
@@ -287,22 +422,48 @@ impl WindowsWindowInner {
         None
     }
 
-    fn handle_size_move_loop_exit(&self, handle: HWND) -> Option<isize> {
+    fn handle_size_move_loop_exit(&self, handle: HWND, message: u32) -> Option<isize> {
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
-        None
+
+        complete_size_move_loop(
+            message,
+            || self.sync_client_rect_size(handle, true),
+            || unsafe {
+                let ret = SetTimer(
+                    Some(handle),
+                    SIZE_MOVE_SETTLE_TIMER_ID,
+                    SIZE_MOVE_SETTLE_DELAY_MS,
+                    None,
+                );
+                if ret == 0 {
+                    log::error!(
+                        "unable to create settle timer after move/size loop: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            },
+        )
     }
 
     fn handle_timer_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
-        if wparam.0 == SIZE_MOVE_LOOP_TIMER_ID {
-            let mut runnables = self.main_receiver.clone().try_iter();
-            while let Some(Ok(runnable)) = runnables.next() {
-                WindowsDispatcher::execute_runnable(runnable);
+        match timer_action(wparam.0) {
+            TimerAction::SizeMoveLoopPaint => {
+                let mut runnables = self.main_receiver.clone().try_iter();
+                while let Some(Ok(runnable)) = runnables.next() {
+                    WindowsDispatcher::execute_runnable(runnable);
+                }
+                self.handle_paint_msg(handle)
             }
-            self.handle_paint_msg(handle)
-        } else {
-            None
+            TimerAction::SettleResample => {
+                unsafe {
+                    KillTimer(Some(handle), SIZE_MOVE_SETTLE_TIMER_ID).log_err();
+                }
+                self.sync_client_rect_size(handle, true);
+                Some(0)
+            }
+            TimerAction::None => None,
         }
     }
 
@@ -1402,6 +1563,100 @@ impl WindowsWindowInner {
         let result = f(&mut input_handler, scale_factor);
         self.state.input_handler.set(Some(input_handler));
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ResampleAction, SIZE_MOVE_LOOP_TIMER_ID, SIZE_MOVE_SETTLE_TIMER_ID, TimerAction,
+        complete_size_move_loop, resample_action, timer_action,
+    };
+    use gpui::{px, size};
+    use std::cell::Cell;
+    use windows::Win32::UI::WindowsAndMessaging::{WM_EXITMENULOOP, WM_EXITSIZEMOVE};
+
+    #[test]
+    fn resample_action_covers_size_scale_and_force_render_changes() {
+        let logical_size = size(px(800.), px(600.));
+
+        assert_eq!(
+            resample_action(logical_size, 1., logical_size, 1., true),
+            ResampleAction::RenderOnly
+        );
+        assert_eq!(
+            resample_action(logical_size, 1., size(px(801.), px(600.)), 1., true,),
+            ResampleAction::NotifyResize {
+                scale_changed: false
+            }
+        );
+        assert_eq!(
+            resample_action(logical_size, 1., logical_size, 1.25, true),
+            ResampleAction::NotifyResize {
+                scale_changed: true
+            }
+        );
+        assert_eq!(
+            resample_action(logical_size, 1., logical_size, 1., false),
+            ResampleAction::Skip
+        );
+    }
+
+    #[test]
+    fn size_move_timer_actions_are_distinct() {
+        assert_ne!(SIZE_MOVE_LOOP_TIMER_ID, SIZE_MOVE_SETTLE_TIMER_ID);
+        assert_eq!(
+            timer_action(SIZE_MOVE_LOOP_TIMER_ID),
+            TimerAction::SizeMoveLoopPaint
+        );
+        assert_eq!(
+            timer_action(SIZE_MOVE_SETTLE_TIMER_ID),
+            TimerAction::SettleResample
+        );
+        assert_eq!(timer_action(usize::MAX), TimerAction::None);
+    }
+
+    #[test]
+    fn size_move_loop_exit_forces_two_samples_without_duplicate_resize_callbacks() {
+        let sampled_logical_size = size(px(800.), px(600.));
+
+        for message in [WM_EXITSIZEMOVE, WM_EXITMENULOOP] {
+            let forced_resamples = Cell::new(0);
+            let armed_settle_rechecks = Cell::new(0);
+            let resize_callbacks = Cell::new(0);
+            let previous_logical_size = Cell::new(size(px(799.), px(600.)));
+            let record_resample = || {
+                forced_resamples.set(forced_resamples.get() + 1);
+                if matches!(
+                    resample_action(
+                        previous_logical_size.get(),
+                        1.,
+                        sampled_logical_size,
+                        1.,
+                        true,
+                    ),
+                    ResampleAction::NotifyResize { .. }
+                ) {
+                    resize_callbacks.set(resize_callbacks.get() + 1);
+                    previous_logical_size.set(sampled_logical_size);
+                }
+            };
+
+            let result = complete_size_move_loop(
+                message,
+                || record_resample(),
+                || armed_settle_rechecks.set(armed_settle_rechecks.get() + 1),
+            );
+
+            assert_eq!(result, Some(0));
+            assert_eq!(forced_resamples.get(), 1);
+            assert_eq!(armed_settle_rechecks.get(), 1);
+            assert_eq!(resize_callbacks.get(), 1);
+
+            record_resample();
+            assert_eq!(forced_resamples.get(), 2);
+            assert_eq!(resize_callbacks.get(), 1);
+        }
     }
 }
 
