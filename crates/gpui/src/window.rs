@@ -2964,10 +2964,13 @@ impl Window {
         self.platform_window.show_window_menu(position)
     }
 
-    /// Handle window movement for Linux and macOS.
-    /// Tells the compositor to take control of window movement (Wayland and X11)
+    /// Starts the platform's imperative window-move operation for an `is_movable: false` window
+    /// that draws its own title bar. On Windows a posted deferral invokes `ReleaseCapture` followed
+    /// by `WM_NCLBUTTONDOWN` with `HTCAPTION`; macOS uses `performWindowDragWithEvent`, and Linux
+    /// compositors take control of the move.
     ///
-    /// Events may not be received during a move operation.
+    /// This is independent of the [`WindowControlArea::Drag`] hit-test path, which maps to
+    /// `HTCAPTION` only for movable windows. Events may not be received during a move operation.
     pub fn start_window_move(&self) {
         self.platform_window.start_window_move()
     }

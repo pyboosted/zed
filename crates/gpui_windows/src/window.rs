@@ -60,6 +60,7 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    pub(crate) start_window_move_posted: Cell<bool>,
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<DirectXRenderer>,
@@ -105,6 +106,29 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+}
+
+fn start_window_move_with(
+    hwnd: HWND,
+    release_capture: impl FnOnce(),
+    send_message: impl FnOnce(HWND, u32, WPARAM, LPARAM),
+) {
+    release_capture();
+    send_message(
+        hwnd,
+        WM_NCLBUTTONDOWN,
+        WPARAM(HTCAPTION as usize),
+        LPARAM(0),
+    );
+}
+
+fn start_window_move_entry(hwnd: HWND, post_message: impl FnOnce(HWND, u32, WPARAM, LPARAM)) {
+    post_message(
+        hwnd,
+        WM_GPUI_START_WINDOW_MOVE,
+        WPARAM::default(),
+        LPARAM::default(),
+    );
 }
 
 impl WindowsWindowState {
@@ -172,6 +196,7 @@ impl WindowsWindowState {
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            start_window_move_posted: Cell::new(false),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
             click_state,
@@ -918,6 +943,27 @@ impl PlatformWindow for WindowsWindow {
         }
     }
 
+    /// Posts a request to start the native move loop for an `is_movable: false` window that draws
+    /// its own title bar. The asynchronous entry lets the move loop run after the GPUI update that
+    /// requested it releases its application borrow. Like every posted message, the request is
+    /// dispatched from the window's ordinary message pump: a nested message pump run inside the
+    /// same update (a synchronous dialog, a COM modal loop) could dispatch it before that update
+    /// unwinds. Repeated calls while a request is pending post nothing; the flag clears when the
+    /// posted request is dispatched.
+    fn start_window_move(&self) {
+        if self.state.start_window_move_posted.replace(true) {
+            return;
+        }
+        start_window_move_entry(self.0.hwnd, |hwnd, message, wparam, lparam| unsafe {
+            if PostMessageW(Some(hwnd), message, wparam, lparam)
+                .log_err()
+                .is_none()
+            {
+                self.state.start_window_move_posted.set(false);
+            }
+        });
+    }
+
     fn toggle_fullscreen(&self) {
         if unsafe { IsWindowVisible(self.0.hwnd).as_bool() } {
             self.0.toggle_fullscreen();
@@ -1061,6 +1107,22 @@ impl PlatformWindow for WindowsWindow {
 
     fn a11y_update_window_bounds(&self) {
         // Windows UIA handles window bounds tracking automatically.
+    }
+}
+
+impl WindowsWindowInner {
+    pub(crate) fn handle_start_window_move(&self, hwnd: HWND) -> Option<isize> {
+        self.state.start_window_move_posted.set(false);
+        start_window_move_with(
+            hwnd,
+            || unsafe {
+                ReleaseCapture().log_err();
+            },
+            |hwnd, message, wparam, lparam| unsafe {
+                SendMessageW(hwnd, message, Some(wparam), Some(lparam));
+            },
+        );
+        Some(0)
     }
 }
 
@@ -1622,9 +1684,60 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
+    use super::{ClickState, start_window_move_entry, start_window_move_with};
+    use crate::WM_GPUI_START_WINDOW_MOVE;
     use gpui::{DevicePixels, MouseButton, point};
-    use std::time::Duration;
+    use std::{cell::Cell, time::Duration};
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        UI::WindowsAndMessaging::{HTCAPTION, WM_NCLBUTTONDOWN},
+    };
+
+    #[test]
+    fn start_window_move_releases_capture_and_sends_caption_mouse_down() {
+        let hwnd = HWND(42 as _);
+        let capture_released = Cell::new(false);
+        let sent_message = Cell::new(None);
+
+        start_window_move_with(
+            hwnd,
+            || capture_released.set(true),
+            |hwnd, message, wparam, lparam| {
+                assert!(capture_released.get());
+                sent_message.set(Some((hwnd, message, wparam, lparam)));
+            },
+        );
+
+        assert_eq!(
+            sent_message.get(),
+            Some((
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                WPARAM(HTCAPTION as usize),
+                LPARAM(0),
+            ))
+        );
+    }
+
+    #[test]
+    fn start_window_move_entry_posts_deferred_message() {
+        let hwnd = HWND(42 as _);
+        let posted_message = Cell::new(None);
+
+        start_window_move_entry(hwnd, |hwnd, message, wparam, lparam| {
+            posted_message.set(Some((hwnd, message, wparam, lparam)));
+        });
+
+        assert_eq!(
+            posted_message.get(),
+            Some((
+                hwnd,
+                WM_GPUI_START_WINDOW_MOVE,
+                WPARAM::default(),
+                LPARAM::default(),
+            ))
+        );
+    }
 
     #[test]
     fn test_double_click_interval() {
