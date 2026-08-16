@@ -79,12 +79,87 @@ pub(crate) struct WindowsPlatformState {
 struct PlatformCallbacks {
     open_urls: Cell<Option<Box<dyn FnMut(Vec<String>)>>>,
     quit: Cell<Option<Box<dyn FnMut()>>>,
+    should_quit: Cell<Option<Box<dyn FnMut() -> bool>>>,
+    /// True while the should-quit callback is running; distinguishes an
+    /// in-flight consultation (empty slot) from "no callback registered".
+    should_quit_in_flight: Cell<bool>,
+    /// Ensures the app-wide `on_quit` teardown runs once per ending session
+    /// even though every top-level window receives `WM_ENDSESSION`.
+    end_session_handled: Cell<bool>,
     reopen: Cell<Option<Box<dyn FnMut()>>>,
     app_menu_action: Cell<Option<Box<dyn FnMut(&dyn Action)>>>,
     will_open_app_menu: Cell<Option<Box<dyn FnMut()>>>,
     validate_app_menu_command: Cell<Option<Box<dyn FnMut(&dyn Action) -> bool>>>,
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+}
+
+/// Outcome of asking the registered should-quit preflight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShouldQuitConsultation {
+    /// No preflight is registered; quitting proceeds as before the API existed.
+    NoCallback,
+    /// A consultation is already running (the callback re-entered via a nested
+    /// message pump, e.g. a save prompt). Quit paths must not proceed and a
+    /// session query must be vetoed until the in-flight consultation decides.
+    InFlight,
+    /// The preflight ran and decided.
+    Decided(bool),
+}
+
+impl ShouldQuitConsultation {
+    /// Whether a quit path (`quit()`, `restart()`) may proceed to `WM_QUIT`.
+    fn permits_quit(self) -> bool {
+        match self {
+            Self::NoCallback | Self::Decided(true) => true,
+            Self::InFlight | Self::Decided(false) => false,
+        }
+    }
+}
+
+/// Platform-window response protocol for `WM_GPUI_QUERY_END_SESSION`. `0` is
+/// deliberately reserved for "not consulted": it is what `DefWindowProcW`
+/// returns for an unknown message (validation mismatch) and what a failed
+/// `SendMessageW` to a destroyed platform window yields, so those paths fall
+/// through to the pre-patch default instead of reading as a veto.
+const SESSION_QUERY_ALLOW: isize = 1;
+const SESSION_QUERY_VETO: isize = 2;
+
+fn encode_session_query_response(consultation: ShouldQuitConsultation) -> isize {
+    match consultation {
+        ShouldQuitConsultation::NoCallback => 0,
+        ShouldQuitConsultation::Decided(true) => SESSION_QUERY_ALLOW,
+        ShouldQuitConsultation::InFlight | ShouldQuitConsultation::Decided(false) => {
+            SESSION_QUERY_VETO
+        }
+    }
+}
+
+/// Window-side interpretation of the platform window's reply. Anything other
+/// than the two explicit responses (including `0` from a validation mismatch,
+/// a destroyed platform window, or an external sender) means "not consulted"
+/// and falls through to `DefWindowProcW`'s default `TRUE`.
+pub(crate) fn session_query_reply(raw: isize) -> Option<isize> {
+    match raw {
+        SESSION_QUERY_ALLOW => Some(1),
+        SESSION_QUERY_VETO => Some(0),
+        _ => None,
+    }
+}
+
+fn consult_should_quit(callbacks: &PlatformCallbacks) -> ShouldQuitConsultation {
+    let Some(mut callback) = callbacks.should_quit.take() else {
+        return if callbacks.should_quit_in_flight.get() {
+            ShouldQuitConsultation::InFlight
+        } else {
+            ShouldQuitConsultation::NoCallback
+        };
+    };
+    callbacks.should_quit_in_flight.set(true);
+    let decision = callback();
+    callbacks.should_quit_in_flight.set(false);
+    callbacks.should_quit.set(Some(callback));
+    ShouldQuitConsultation::Decided(decision)
 }
 
 impl WindowsPlatformState {
@@ -431,8 +506,13 @@ impl Platform for WindowsPlatform {
     }
 
     fn quit(&self) {
+        let inner = self.inner.clone();
         self.foreground_executor()
-            .spawn(async { unsafe { PostQuitMessage(0) } })
+            .spawn(async move {
+                if consult_should_quit(&inner.state.callbacks).permits_quit() {
+                    unsafe { PostQuitMessage(0) };
+                }
+            })
             .detach();
     }
 
@@ -464,8 +544,17 @@ impl Platform for WindowsPlatform {
         // can pump the Win32 message loop (via `CreateProcessW`), which
         // re-enters message handling possibly resulting in another mutable
         // borrow of the `AppCell` ending up with a double borrow panic
+        let inner = self.inner.clone();
         self.foreground_executor
             .spawn(async move {
+                // Restart terminates the app, so it consults the should-quit
+                // preflight like `quit()` (macOS routes its restart through
+                // `applicationShouldTerminate` the same way). Consulting
+                // BEFORE spawning the watcher script means a vetoed restart
+                // leaves no orphan watcher waiting to resurrect the app.
+                if !consult_should_quit(&inner.state.callbacks).permits_quit() {
+                    return;
+                }
                 #[allow(
                     clippy::disallowed_methods,
                     reason = "We are restarting ourselves, using std command thus is fine"
@@ -625,6 +714,14 @@ impl Platform for WindowsPlatform {
 
     fn on_quit(&self, callback: Box<dyn FnMut()>) {
         self.inner.state.callbacks.quit.set(Some(callback));
+    }
+
+    /// Mirrors macOS `applicationShouldTerminate`. Windows delivers
+    /// `WM_QUERYENDSESSION` per window, so one session-end wave may consult this
+    /// `FnMut` more than once, with each consultation making an independent decision.
+    /// Windows may still terminate the process after a shutdown timeout despite a veto.
+    fn on_should_quit(&self, callback: Box<dyn FnMut() -> bool>) {
+        self.inner.state.callbacks.should_quit.set(Some(callback));
     }
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
@@ -953,7 +1050,9 @@ impl WindowsPlatformInner {
             | WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD
             | WM_GPUI_DOCK_MENU_ACTION
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
-            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
+            | WM_GPUI_GPU_DEVICE_LOST
+            | WM_GPUI_QUERY_END_SESSION
+            | WM_GPUI_END_SESSION => self.handle_gpui_events(msg, wparam, lparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
             _ => None,
         };
@@ -978,6 +1077,15 @@ impl WindowsPlatformInner {
             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            WM_GPUI_QUERY_END_SESSION => Some(encode_session_query_response(
+                consult_should_quit(&self.state.callbacks),
+            )),
+            WM_GPUI_END_SESSION => {
+                if !self.state.callbacks.end_session_handled.replace(true) {
+                    self.with_callback(|callbacks| &callbacks.quit, |callback| callback());
+                }
+                Some(0)
+            }
             _ => unreachable!(),
         }
     }
@@ -1493,8 +1601,115 @@ unsafe extern "system" fn window_procedure(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use crate::{read_from_clipboard, write_to_clipboard};
     use gpui::ClipboardItem;
+
+    use super::{
+        PlatformCallbacks, SESSION_QUERY_ALLOW, SESSION_QUERY_VETO, ShouldQuitConsultation,
+        consult_should_quit, encode_session_query_response, session_query_reply,
+    };
+
+    fn callbacks_with_should_quit(callback: impl FnMut() -> bool + 'static) -> PlatformCallbacks {
+        let callbacks = PlatformCallbacks::default();
+        callbacks.should_quit.set(Some(Box::new(callback)));
+        callbacks
+    }
+
+    /// The full platform-to-window protocol, composed exactly as production
+    /// composes it: consult -> encode (platform window) -> reply (app window).
+    fn end_to_end_reply(callbacks: &PlatformCallbacks) -> Option<isize> {
+        session_query_reply(encode_session_query_response(consult_should_quit(callbacks)))
+    }
+
+    #[test]
+    fn session_query_protocol_end_to_end() {
+        // No callback registered: platform answers 0, window falls through to
+        // DefWindowProc (pre-patch behavior).
+        let callbacks = PlatformCallbacks::default();
+        assert_eq!(end_to_end_reply(&callbacks), None);
+
+        // Allow.
+        let callbacks = callbacks_with_should_quit(|| true);
+        assert_eq!(end_to_end_reply(&callbacks), Some(1));
+
+        // Veto.
+        let callbacks = callbacks_with_should_quit(|| false);
+        assert_eq!(end_to_end_reply(&callbacks), Some(0));
+
+        // In-flight consultation (callback slot taken, flag set): veto, and
+        // permits_quit() is false so a nested quit()/restart() is dropped.
+        let callbacks = PlatformCallbacks::default();
+        callbacks.should_quit_in_flight.set(true);
+        assert_eq!(
+            consult_should_quit(&callbacks),
+            ShouldQuitConsultation::InFlight
+        );
+        assert!(!consult_should_quit(&callbacks).permits_quit());
+        assert_eq!(end_to_end_reply(&callbacks), Some(0));
+
+        // Failure values a window can actually receive (DefWindowProc for an
+        // unknown message, destroyed platform window, external garbage) must
+        // read as "not consulted", never as a veto.
+        for raw in [0, -1, 7, isize::MAX] {
+            if raw != SESSION_QUERY_ALLOW && raw != SESSION_QUERY_VETO {
+                assert_eq!(session_query_reply(raw), None, "raw {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn should_quit_callback_is_invoked_once_reused_and_flagged_in_flight() {
+        let invocation_count = Rc::new(Cell::new(0));
+        let observed_in_flight = Rc::new(Cell::new(false));
+
+        let callbacks = Rc::new(callbacks_with_should_quit({
+            let invocation_count = invocation_count.clone();
+            move || {
+                invocation_count.update(|count| count + 1);
+                true
+            }
+        }));
+        // Observe the in-flight flag from inside a consultation.
+        {
+            let callbacks_inner: Rc<PlatformCallbacks> = callbacks.clone();
+            let observed = observed_in_flight.clone();
+            let count = invocation_count.clone();
+            callbacks.should_quit.set(Some(Box::new(move || {
+                count.update(|c| c + 1);
+                observed.set(callbacks_inner.should_quit_in_flight.get());
+                // A nested consult during the callback must report InFlight.
+                assert_eq!(
+                    consult_should_quit(&callbacks_inner),
+                    ShouldQuitConsultation::InFlight
+                );
+                true
+            })));
+        }
+
+        assert_eq!(
+            consult_should_quit(&callbacks),
+            ShouldQuitConsultation::Decided(true)
+        );
+        assert_eq!(invocation_count.get(), 1);
+        assert!(observed_in_flight.get());
+        // Reinserted and reusable; flag cleared.
+        assert!(!callbacks.should_quit_in_flight.get());
+        assert_eq!(
+            consult_should_quit(&callbacks),
+            ShouldQuitConsultation::Decided(true)
+        );
+        assert_eq!(invocation_count.get(), 2);
+    }
+
+    #[test]
+    fn quit_permission_matrix() {
+        assert!(ShouldQuitConsultation::NoCallback.permits_quit());
+        assert!(ShouldQuitConsultation::Decided(true).permits_quit());
+        assert!(!ShouldQuitConsultation::Decided(false).permits_quit());
+        assert!(!ShouldQuitConsultation::InFlight.permits_quit());
+    }
 
     #[test]
     fn test_clipboard() {

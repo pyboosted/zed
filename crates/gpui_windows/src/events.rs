@@ -29,6 +29,8 @@ pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_START_WINDOW_MOVE: u32 = WM_USER + 9;
+pub(crate) const WM_GPUI_QUERY_END_SESSION: u32 = WM_USER + 10;
+pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 11;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 const SIZE_MOVE_SETTLE_TIMER_ID: usize = 2;
@@ -191,6 +193,8 @@ impl WindowsWindowInner {
             WM_PAINT => self.handle_paint_msg(handle),
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
+            WM_QUERYENDSESSION => self.handle_query_end_session_msg(),
+            WM_ENDSESSION => self.handle_end_session_msg(wparam),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
@@ -503,6 +507,34 @@ impl WindowsWindowInner {
         let should_close = callback();
         self.state.callbacks.should_close.set(Some(callback));
         if should_close { None } else { Some(0) }
+    }
+
+    fn handle_query_end_session_msg(&self) -> Option<isize> {
+        let response = unsafe {
+            SendMessageW(
+                self.platform_window_handle,
+                WM_GPUI_QUERY_END_SESSION,
+                Some(WPARAM(self.validation_number)),
+                None,
+            )
+        };
+        session_query_reply(response.0)
+    }
+
+    fn handle_end_session_msg(&self, wparam: WPARAM) -> Option<isize> {
+        if wparam.0 == 0 {
+            return None;
+        }
+
+        unsafe {
+            SendMessageW(
+                self.platform_window_handle,
+                WM_GPUI_END_SESSION,
+                Some(WPARAM(self.validation_number)),
+                None,
+            );
+        }
+        Some(0)
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {

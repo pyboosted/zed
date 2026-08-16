@@ -2274,8 +2274,19 @@ impl App {
     /// Returning `false` cancels the native quit request.
     pub fn on_should_quit(&self, mut on_should_quit: impl FnMut(&mut App) -> bool + 'static) {
         let cx = self.to_async();
-        self.platform
-            .on_should_quit(Box::new(move || cx.update(|cx| on_should_quit(cx))));
+        self.platform.on_should_quit(Box::new(move || {
+            // A session-end query can be delivered re-entrantly while the App
+            // is already borrowed (a nested native message pump inside an
+            // update, e.g. a file dialog). Veto rather than panic: the OS
+            // reports the app as blocking shutdown and retries.
+            let Some(app) = cx.app.upgrade() else {
+                return true;
+            };
+            let Ok(mut lock) = app.try_borrow_mut() else {
+                return false;
+            };
+            lock.update(|cx| on_should_quit(cx))
+        }));
     }
 
     /// Register a callback to be invoked when a window is closed
