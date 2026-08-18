@@ -743,9 +743,8 @@ impl DirectXRenderer {
                 })
             }
             RenderPlan::Damage { damage, current } => {
-                match self.draw_motion_damage(scene, damage) {
-                    Ok((metrics, mut rect)) => {
-                        self.present_dirty(&mut rect)?;
+                match self.draw_and_present_motion_damage(scene, damage) {
+                    Ok((metrics, rect)) => {
                         self.motion_damage_history.did_present_damage(current);
                         Ok(RendererOutcome {
                             origin: profiler::RendererFrameOrigin::RetainedDamage,
@@ -756,7 +755,7 @@ impl DirectXRenderer {
                         })
                     }
                     Err(error) => {
-                        log::warn!("motion-damage preparation failed; using full frame: {error:#}");
+                        log::warn!("motion-damage attempt failed; using full frame: {error:#}");
                         self.invalidate_motion_damage();
                         let result = self.draw_full_scene(
                             scene,
@@ -777,6 +776,19 @@ impl DirectXRenderer {
                 }
             }
         }
+    }
+
+    /// Treat drawing and dirty presentation as one experimental attempt. Any
+    /// error is handled by the caller with an ordinary full replay, and the
+    /// per-buffer history is advanced only after this returns successfully.
+    fn draw_and_present_motion_damage(
+        &mut self,
+        scene: &Scene,
+        damage: Bounds<ScaledPixels>,
+    ) -> Result<(RendererMetrics, RECT)> {
+        let (metrics, mut rect) = self.draw_motion_damage(scene, damage)?;
+        self.present_dirty(&mut rect)?;
+        Ok((metrics, rect))
     }
 
     fn draw_full_scene(

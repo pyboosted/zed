@@ -1370,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_motion_history_invalidation_requires_full_rewarm() {
+    fn retained_motion_history_does_not_advance_before_present_success() {
         let p0 = test_bounds(0.0, 0.0);
         let p1 = test_bounds(20.0, 0.0);
         let p2 = test_bounds(40.0, 0.0);
@@ -1379,10 +1379,22 @@ mod tests {
         history.observe_retained_full(p0, 3);
         history.observe_retained_full(p0, 3);
         assert!(history.is_coherent(3));
-        assert_eq!(history.next_damage(p2), Some(p0.union(&p2)));
-        // Merely computing or attempting a damage frame must not advance the
-        // buffer cursor; only a successful Present1 may do so.
+
         assert_eq!(history.next_damage(p1), Some(p0.union(&p1)));
+        // Simulate a failed Present1 by deliberately not committing p1. The
+        // next attempt must still target the same backbuffer's p0 contents.
+        assert_eq!(history.next_damage(p2), Some(p0.union(&p2)));
+    }
+
+    #[test]
+    fn retained_motion_history_invalidation_requires_full_rewarm() {
+        let p0 = test_bounds(0.0, 0.0);
+        let p1 = test_bounds(20.0, 0.0);
+        let mut history = RetainedMotionDamageHistory::default();
+        history.begin_scene(p0, 3);
+        history.observe_retained_full(p0, 3);
+        history.observe_retained_full(p0, 3);
+        assert!(history.is_coherent(3));
 
         history.invalidate();
         assert!(!history.is_coherent(3));
