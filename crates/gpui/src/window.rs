@@ -1768,10 +1768,17 @@ impl Window {
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
+                let explicitly_needs_present = needs_present.get();
+                let high_rate_input =
+                    active.get() && input_rate_tracker.borrow_mut().is_high_rate();
+                let retained_motion_only = motion_due
+                    && !request_frame_options.require_presentation
+                    && !explicitly_needs_present
+                    && !high_rate_input;
                 let needs_present = request_frame_options.require_presentation
-                    || needs_present.get()
+                    || explicitly_needs_present
                     || motion_due
-                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
+                    || high_rate_input;
 
                 let preparation_start = profiler::frame_trace_enabled().then(Instant::now);
                 let presentation_kind = if invalidator.is_dirty() || force_render {
@@ -1784,7 +1791,7 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
-                                window.present();
+                                window.present(profiler::PresentationKind::Drawn, motion_due);
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
@@ -1792,7 +1799,10 @@ impl Window {
                     Some(profiler::PresentationKind::Drawn)
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, _| {
+                            window
+                                .present(profiler::PresentationKind::Retained, retained_motion_only)
+                        })
                         .log_err();
                     Some(profiler::PresentationKind::Retained)
                 } else {
@@ -3440,8 +3450,15 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) {
-        self.platform_window.draw(&self.rendered_frame.scene);
+    fn present(&mut self, kind: profiler::PresentationKind, motion_only: bool) {
+        match kind {
+            profiler::PresentationKind::Drawn => {
+                self.platform_window.draw(&self.rendered_frame.scene)
+            }
+            profiler::PresentationKind::Retained => self
+                .platform_window
+                .draw_retained(&self.rendered_frame.scene, motion_only),
+        }
         self.motion_presentation
             .borrow_mut()
             .did_present(Instant::now());
@@ -3459,7 +3476,7 @@ impl Window {
     #[cfg(feature = "bench")]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
-            self.present();
+            self.present(profiler::PresentationKind::Drawn, false);
         }
     }
 

@@ -18,7 +18,7 @@ pub(crate) use actions::{save_action_timing, update_running_action};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SharedString, TasksIncluded, WindowId};
+use crate::{RetainedMotionDamageFallback, SharedString, TasksIncluded, WindowId};
 
 #[cfg(feature = "profiler")]
 #[doc(hidden)]
@@ -736,6 +736,106 @@ pub struct PresentationTiming {
     pub preparation_end: Instant,
 }
 
+/// Renderer work selected for one presentation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RendererFrameOrigin {
+    /// A newly built scene took the ordinary full renderer path.
+    Full,
+    /// A retained scene took the ordinary full renderer path.
+    RetainedFull,
+    /// A retained scene used bounded motion damage.
+    RetainedDamage,
+}
+
+/// Swapchain API used for a renderer submission.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RendererPresentKind {
+    /// Ordinary full `Present`.
+    Present,
+    /// `Present1` with a dirty rectangle.
+    Present1,
+}
+
+/// Why a retained motion request used the safe full-render fallback.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RendererFallbackReason {
+    /// No fallback occurred.
+    None,
+    /// The experiment is disabled (the production default).
+    ExperimentDisabled,
+    /// This presentation was not requested solely by retained motion.
+    NotMotionOnly,
+    /// The window uses a background mode outside the bounded experiment.
+    UnsupportedBackground,
+    /// Scene structure is outside the bounded eligibility contract.
+    Scene(RetainedMotionDamageFallback),
+    /// Not every flip-chain buffer contains the current full scene yet.
+    HistoryUncertain,
+    /// The coherent underlap snapshot was unavailable.
+    MissingUnderlap,
+}
+
+/// Primitive counts used by renderer upload and scene diagnostics.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[expect(missing_docs)]
+pub struct RendererPrimitiveCounts {
+    pub shadows: u32,
+    pub quads: u32,
+    pub effects: u32,
+    pub paths: u32,
+    pub underlines: u32,
+    pub monochrome_sprites: u32,
+    pub subpixel_sprites: u32,
+    pub polychrome_sprites: u32,
+    pub surfaces: u32,
+}
+
+impl RendererPrimitiveCounts {
+    /// Returns the total number of recorded primitive instances.
+    pub fn total(self) -> u32 {
+        self.shadows
+            .saturating_add(self.quads)
+            .saturating_add(self.effects)
+            .saturating_add(self.paths)
+            .saturating_add(self.underlines)
+            .saturating_add(self.monochrome_sprites)
+            .saturating_add(self.subpixel_sprites)
+            .saturating_add(self.polychrome_sprites)
+            .saturating_add(self.surfaces)
+    }
+}
+
+/// Renderer-boundary diagnostics for one submitted frame.
+#[derive(Debug, Copy, Clone)]
+#[expect(missing_docs)]
+pub struct RendererFrameTiming {
+    /// Static renderer identifier, for example `directx11`.
+    pub backend: &'static str,
+    pub origin: RendererFrameOrigin,
+    pub scene: RendererPrimitiveCounts,
+    pub uploads: RendererPrimitiveCounts,
+    pub uploaded_bytes: u64,
+    pub draw_calls: u32,
+    pub effect_draw_calls: u32,
+    /// `[left, top, right, bottom]` in physical pixels.
+    pub damage_rect: Option<[i32; 4]>,
+    pub damaged_pixels: u64,
+    pub fallback: RendererFallbackReason,
+    pub present: RendererPresentKind,
+    pub preparation_start: Instant,
+    pub preparation_end: Instant,
+    /// Best-effort GPU duration. `None` when the backend cannot collect it
+    /// without synchronously stalling the render thread.
+    pub gpu_duration: Option<Duration>,
+}
+
+impl RendererFrameTiming {
+    /// CPU time spent inside the renderer boundary.
+    pub fn preparation_duration(&self) -> Duration {
+        self.preparation_end.duration_since(self.preparation_start)
+    }
+}
+
 impl PresentationTiming {
     /// CPU time spent preparing and submitting this presentation.
     pub fn preparation_duration(&self) -> Duration {
@@ -778,6 +878,20 @@ struct PresentationTimings {
     total_pushed: u64,
 }
 
+const MAX_RENDERER_FRAME_TIMINGS: usize =
+    (16 * 1024 * 1024) / core::mem::size_of::<RendererFrameTiming>();
+
+struct RendererFrameTimings {
+    timings: VecDeque<RendererFrameTiming>,
+    total_pushed: u64,
+}
+
+static RENDERER_FRAME_TIMINGS: spin::Mutex<RendererFrameTimings> =
+    spin::Mutex::new(RendererFrameTimings {
+        timings: VecDeque::new(),
+        total_pushed: 0,
+    });
+
 static PRESENTATION_TIMINGS: spin::Mutex<PresentationTimings> =
     spin::Mutex::new(PresentationTimings {
         timings: VecDeque::new(),
@@ -805,6 +919,10 @@ pub fn set_frame_trace_enabled(enabled: bool) -> bool {
         presentations.timings.clear();
         presentations.timings.shrink_to_fit();
         presentations.total_pushed = 0;
+        let mut renderer_frames = RENDERER_FRAME_TIMINGS.lock();
+        renderer_frames.timings.clear();
+        renderer_frames.timings.shrink_to_fit();
+        renderer_frames.total_pushed = 0;
     }
     true
 }
@@ -812,6 +930,12 @@ pub fn set_frame_trace_enabled(enabled: bool) -> bool {
 /// Returns whether frame timing collection is enabled.
 pub fn frame_trace_enabled() -> bool {
     FRAME_TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Returns a timestamp in the same clock domain as renderer diagnostics.
+#[doc(hidden)]
+pub fn renderer_frame_timestamp() -> Instant {
+    Instant::now()
 }
 
 /// Records the timing of a drawn window frame.
@@ -846,6 +970,23 @@ pub fn record_presentation_timing(timing: PresentationTiming) {
     }
     presentations.timings.push_back(timing);
     presentations.total_pushed += 1;
+}
+
+/// Records renderer-boundary work for a submitted frame.
+///
+/// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
+pub fn record_renderer_frame_timing(timing: RendererFrameTiming) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+
+    let mut frames = RENDERER_FRAME_TIMINGS.lock();
+    if frames.timings.len() >= MAX_RENDERER_FRAME_TIMINGS {
+        frames.timings.pop_front();
+    }
+    frames.timings.push_back(timing);
+    frames.total_pushed += 1;
 }
 
 /// Drains frame timings recorded after this collector was created, tracking a
@@ -919,6 +1060,42 @@ impl PresentationTimingCollector {
             .copied()
             .collect();
         self.cursor = presentations.total_pushed;
+        unseen
+    }
+}
+
+/// Collects renderer-boundary timings recorded after construction.
+pub struct RendererFrameTimingCollector {
+    cursor: u64,
+}
+
+impl Default for RendererFrameTimingCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RendererFrameTimingCollector {
+    /// Creates a collector that only sees later renderer submissions.
+    pub fn new() -> Self {
+        Self {
+            cursor: RENDERER_FRAME_TIMINGS.lock().total_pushed,
+        }
+    }
+
+    /// Returns renderer submissions recorded since the previous call.
+    pub fn collect_unseen(&mut self) -> Vec<RendererFrameTiming> {
+        let frames = RENDERER_FRAME_TIMINGS.lock();
+        let buffer_len = frames.timings.len() as u64;
+        let buffer_start = frames.total_pushed.saturating_sub(buffer_len);
+        let skip = self.cursor.saturating_sub(buffer_start) as usize;
+        let unseen = frames
+            .timings
+            .iter()
+            .skip(skip.min(frames.timings.len()))
+            .copied()
+            .collect();
+        self.cursor = frames.total_pushed;
         unseen
     }
 }

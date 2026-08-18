@@ -1069,6 +1069,14 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn draw_retained(&self, scene: &Scene, motion_only: bool) {
+        self.state
+            .renderer
+            .borrow_mut()
+            .draw_retained(scene, self.state.background_appearance.get(), motion_only)
+            .log_err();
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }

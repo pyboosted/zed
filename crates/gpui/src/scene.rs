@@ -61,6 +61,86 @@ pub(crate) struct MotionSchedule {
     buckets: Vec<MotionScheduleBucket>,
 }
 
+/// Why a retained scene cannot use the bounded motion-damage experiment.
+///
+/// This is exposed for renderer diagnostics. It is not a product-facing
+/// rendering contract.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedMotionDamageFallback {
+    /// The scene has no procedural motion effect.
+    NoEffect,
+    /// The experiment is deliberately bounded to one effect instance.
+    MultipleEffects,
+    /// Native or externally-produced surfaces require the ordinary renderer.
+    ExternalSurface,
+    /// A non-effect primitive is interleaved with or above the effect.
+    InterleavedOrder,
+    /// The effect is not the initially-supported spinner primitive.
+    UnsupportedEffect,
+}
+
+/// Conservative pixel damage for an eligible retained-motion scene.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetainedMotionDamage {
+    /// Effect bounds clipped by the effect's content mask.
+    pub bounds: Bounds<ScaledPixels>,
+}
+
+/// Tracks damage and flip-chain coherence for a retained scene.
+///
+/// A renderer must call [`Self::begin_scene`] after an ordinary scene draw,
+/// [`Self::observe_retained_full`] after each fallback full replay, and may use
+/// [`Self::next_damage`] only when [`Self::is_coherent`] is true.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetainedMotionDamageHistory {
+    previous: Option<Bounds<ScaledPixels>>,
+    coherent_back_buffers: usize,
+}
+
+impl RetainedMotionDamageHistory {
+    /// Starts history for a newly drawn scene. Only the current flip-chain
+    /// buffer is known to contain that scene.
+    pub fn begin_scene(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.previous = Some(bounds);
+        self.coherent_back_buffers = 1;
+    }
+
+    /// Records a full replay of the same retained scene into another buffer.
+    pub fn observe_retained_full(&mut self, bounds: Bounds<ScaledPixels>, buffer_count: usize) {
+        if self.previous.is_none() {
+            self.begin_scene(bounds);
+            return;
+        }
+        self.previous = Some(bounds);
+        self.coherent_back_buffers = self
+            .coherent_back_buffers
+            .saturating_add(1)
+            .min(buffer_count);
+    }
+
+    /// Returns whether every flip-chain buffer has received a full scene.
+    pub fn is_coherent(&self, buffer_count: usize) -> bool {
+        buffer_count > 0 && self.previous.is_some() && self.coherent_back_buffers >= buffer_count
+    }
+
+    /// Returns the union of previous and current effect bounds and advances
+    /// history. Callers must establish coherent buffer history first.
+    pub fn next_damage(&mut self, current: Bounds<ScaledPixels>) -> Option<Bounds<ScaledPixels>> {
+        let previous = self.previous?;
+        let damage = previous.union(&current);
+        self.previous = Some(current);
+        Some(damage)
+    }
+
+    /// Invalidates all scene and swapchain history.
+    pub fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MotionScheduleBucket {
     frame_interval: Duration,
@@ -230,6 +310,56 @@ impl Scene {
 
     pub(crate) fn motion_schedule(&self) -> &MotionSchedule {
         &self.motion_schedule
+    }
+
+    /// Classifies the deliberately narrow scene accepted by the DirectX
+    /// retained-motion damage experiment.
+    #[doc(hidden)]
+    pub fn retained_motion_damage(
+        &self,
+    ) -> Result<RetainedMotionDamage, RetainedMotionDamageFallback> {
+        let effect = match self.effects.as_slice() {
+            [] => return Err(RetainedMotionDamageFallback::NoEffect),
+            [effect] => effect,
+            _ => return Err(RetainedMotionDamageFallback::MultipleEffects),
+        };
+        if !self.surfaces.is_empty() {
+            return Err(RetainedMotionDamageFallback::ExternalSurface);
+        }
+        if effect.kind != 0 {
+            return Err(RetainedMotionDamageFallback::UnsupportedEffect);
+        }
+
+        let non_effect_max_order = self
+            .shadows
+            .iter()
+            .map(|primitive| primitive.order)
+            .chain(self.quads.iter().map(|primitive| primitive.order))
+            .chain(self.paths.iter().map(|primitive| primitive.order))
+            .chain(self.underlines.iter().map(|primitive| primitive.order))
+            .chain(
+                self.monochrome_sprites
+                    .iter()
+                    .map(|primitive| primitive.order),
+            )
+            .chain(
+                self.subpixel_sprites
+                    .iter()
+                    .map(|primitive| primitive.order),
+            )
+            .chain(
+                self.polychrome_sprites
+                    .iter()
+                    .map(|primitive| primitive.order),
+            )
+            .max();
+        if non_effect_max_order.is_some_and(|order| order >= effect.order) {
+            return Err(RetainedMotionDamageFallback::InterleavedOrder);
+        }
+
+        Ok(RetainedMotionDamage {
+            bounds: effect.bounds.intersect(&effect.content_mask.bounds),
+        })
     }
 
     #[cfg_attr(
@@ -1073,6 +1203,7 @@ impl PathVertex<Pixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::size;
 
     #[test]
     fn motion_schedule_uses_fastest_active_bucket() {
@@ -1114,5 +1245,51 @@ mod tests {
             schedule.active_frame_interval(now + Duration::from_secs(10)),
             Some(Duration::from_millis(33))
         );
+    }
+
+    #[test]
+    fn retained_motion_damage_rejects_interleaved_content() {
+        let mut scene = Scene::default();
+        scene.effects.push(EffectQuad {
+            order: 3,
+            kind: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(10.0), ScaledPixels(20.0)),
+                size(ScaledPixels(16.0), ScaledPixels(16.0)),
+            ),
+            content_mask: ContentMask::default(),
+            ..Default::default()
+        });
+        scene.quads.push(Quad {
+            order: 3,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            scene.retained_motion_damage(),
+            Err(RetainedMotionDamageFallback::InterleavedOrder)
+        );
+    }
+
+    #[test]
+    fn retained_motion_history_unions_previous_and_current_bounds() {
+        let previous = Bounds::new(
+            point(ScaledPixels(10.0), ScaledPixels(20.0)),
+            size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        );
+        let current = Bounds::new(
+            point(ScaledPixels(18.0), ScaledPixels(12.0)),
+            size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        );
+        let mut history = RetainedMotionDamageHistory::default();
+        history.begin_scene(previous);
+        assert!(!history.is_coherent(3));
+        history.observe_retained_full(previous, 3);
+        history.observe_retained_full(previous, 3);
+        assert!(history.is_coherent(3));
+        assert_eq!(history.next_damage(current), Some(previous.union(&current)));
+        history.invalidate();
+        assert!(!history.is_coherent(3));
+        assert_eq!(history.next_damage(current), None);
     }
 }

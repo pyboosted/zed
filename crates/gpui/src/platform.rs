@@ -843,6 +843,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Replays an already-built scene. Platforms may specialize motion-only
+    /// retained frames; the default preserves the ordinary full draw path.
+    fn draw_retained(&self, scene: &Scene, _motion_only: bool) {
+        self.draw(scene);
+    }
     fn capture_png(&self, _scene: &Scene, _path: &std::path::Path) -> Result<()> {
         anyhow::bail!("window capture is not implemented on this platform")
     }
