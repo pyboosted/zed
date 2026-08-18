@@ -773,6 +773,12 @@ pub enum RendererFallbackReason {
     HistoryUncertain,
     /// The coherent underlap snapshot was unavailable.
     MissingUnderlap,
+    /// Preparing the underlap snapshot failed; this frame still used the
+    /// ordinary full presentation path.
+    UnderlapCaptureFailed,
+    /// The bounded damage path failed before presentation; the same frame was
+    /// replayed through the ordinary full renderer.
+    DamagePathFailed,
 }
 
 /// Primitive counts used by renderer upload and scene diagnostics.

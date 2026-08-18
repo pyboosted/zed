@@ -96,6 +96,12 @@ struct RendererMetrics {
     effect_draw_calls: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct FullSceneResult {
+    metrics: RendererMetrics,
+    underlap_captured: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RendererOutcome {
     origin: profiler::RendererFrameOrigin,
@@ -114,7 +120,30 @@ enum RenderPlan {
     },
     Damage {
         damage: Bounds<ScaledPixels>,
+        current: Bounds<ScaledPixels>,
     },
+}
+
+fn retained_damage_fallback(
+    motion_only: bool,
+    opaque: bool,
+    scene_damage: Result<RetainedMotionDamage, RetainedMotionDamageFallback>,
+    coherent_history: bool,
+    has_underlap: bool,
+) -> Option<profiler::RendererFallbackReason> {
+    if !motion_only {
+        Some(profiler::RendererFallbackReason::NotMotionOnly)
+    } else if !opaque {
+        Some(profiler::RendererFallbackReason::UnsupportedBackground)
+    } else if let Err(reason) = scene_damage {
+        Some(profiler::RendererFallbackReason::Scene(reason))
+    } else if !coherent_history {
+        Some(profiler::RendererFallbackReason::HistoryUncertain)
+    } else if !has_underlap {
+        Some(profiler::RendererFallbackReason::MissingUnderlap)
+    } else {
+        None
+    }
 }
 
 struct CaptureDevice {
@@ -545,7 +574,12 @@ impl DirectXRenderer {
 
         let preparation_start =
             profiler::frame_trace_enabled().then(profiler::renderer_frame_timestamp);
-        let result = self.draw_requested_impl(scene, background_appearance, request);
+        let result = self.draw_requested_impl(
+            scene,
+            background_appearance,
+            request,
+            preparation_start.is_some(),
+        );
         if result.is_err() {
             self.invalidate_motion_damage();
         }
@@ -588,7 +622,34 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
         request: FrameRequest,
+        collect_metrics: bool,
     ) -> Result<RendererOutcome> {
+        // Preserve the production renderer's former hot path when the
+        // experiment is disabled. In particular, do not classify or scan the
+        // retained scene merely because a motion timer requested the frame.
+        if self.retained_mode == RetainedRenderMode::Full {
+            let origin = match request {
+                FrameRequest::Full => profiler::RendererFrameOrigin::Full,
+                FrameRequest::Retained { .. } => profiler::RendererFrameOrigin::RetainedFull,
+            };
+            let fallback = match request {
+                FrameRequest::Full => profiler::RendererFallbackReason::None,
+                FrameRequest::Retained { .. } => {
+                    profiler::RendererFallbackReason::ExperimentDisabled
+                }
+            };
+            let result =
+                self.draw_full_scene(scene, background_appearance, false, false, collect_metrics)?;
+            self.present()?;
+            return Ok(RendererOutcome {
+                origin,
+                fallback,
+                present: profiler::RendererPresentKind::Present,
+                damage_rect: None,
+                metrics: result.metrics,
+            });
+        }
+
         let scene_damage = scene.retained_motion_damage();
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
         let plan = match request {
@@ -601,12 +662,7 @@ impl DirectXRenderer {
                     .flatten(),
             },
             FrameRequest::Retained { motion_only } => match self.retained_mode {
-                RetainedRenderMode::Full => RenderPlan::Full {
-                    origin: profiler::RendererFrameOrigin::RetainedFull,
-                    fallback: profiler::RendererFallbackReason::ExperimentDisabled,
-                    skip_immutable_uploads: false,
-                    capture_underlap: None,
-                },
+                RetainedRenderMode::Full => unreachable!("handled by the production fast path"),
                 RetainedRenderMode::Immutable => RenderPlan::Full {
                     origin: profiler::RendererFrameOrigin::RetainedFull,
                     fallback: profiler::RendererFallbackReason::None,
@@ -614,23 +670,15 @@ impl DirectXRenderer {
                     capture_underlap: None,
                 },
                 RetainedRenderMode::Damage => {
-                    let fallback = if !motion_only {
-                        Some(profiler::RendererFallbackReason::NotMotionOnly)
-                    } else if !opaque {
-                        Some(profiler::RendererFallbackReason::UnsupportedBackground)
-                    } else if let Err(reason) = scene_damage {
-                        Some(profiler::RendererFallbackReason::Scene(reason))
-                    } else if !self.motion_damage_history.is_coherent(BUFFER_COUNT) {
-                        Some(profiler::RendererFallbackReason::HistoryUncertain)
-                    } else if self
-                        .resources
-                        .as_ref()
-                        .is_none_or(|resources| resources.motion_underlap.is_none())
-                    {
-                        Some(profiler::RendererFallbackReason::MissingUnderlap)
-                    } else {
-                        None
-                    };
+                    let fallback = retained_damage_fallback(
+                        motion_only,
+                        opaque,
+                        scene_damage,
+                        self.motion_damage_history.is_coherent(BUFFER_COUNT),
+                        self.resources
+                            .as_ref()
+                            .is_some_and(|resources| resources.motion_underlap.is_some()),
+                    );
 
                     if let Some(fallback) = fallback {
                         RenderPlan::Full {
@@ -645,7 +693,7 @@ impl DirectXRenderer {
                             .motion_damage_history
                             .next_damage(current)
                             .context("coherent history lost current motion bounds")?;
-                        RenderPlan::Damage { damage }
+                        RenderPlan::Damage { damage, current }
                     }
                 }
             },
@@ -654,7 +702,7 @@ impl DirectXRenderer {
         match plan {
             RenderPlan::Full {
                 origin,
-                fallback,
+                mut fallback,
                 skip_immutable_uploads,
                 capture_underlap,
             } => {
@@ -664,19 +712,26 @@ impl DirectXRenderer {
                 if capture_underlap.is_none() {
                     self.invalidate_motion_damage();
                 }
-                let metrics = self.draw_full_scene(
+                let result = self.draw_full_scene(
                     scene,
                     background_appearance,
                     skip_immutable_uploads,
                     capture_underlap.is_some(),
+                    collect_metrics,
                 )?;
                 self.present()?;
                 if let Some(damage) = capture_underlap {
-                    if request == FrameRequest::Full {
-                        self.motion_damage_history.begin_scene(damage.bounds);
+                    if result.underlap_captured {
+                        if request == FrameRequest::Full {
+                            self.motion_damage_history
+                                .begin_scene(damage.bounds, BUFFER_COUNT);
+                        } else {
+                            self.motion_damage_history
+                                .observe_retained_full(damage.bounds, BUFFER_COUNT);
+                        }
                     } else {
-                        self.motion_damage_history
-                            .observe_retained_full(damage.bounds, BUFFER_COUNT);
+                        self.invalidate_motion_damage();
+                        fallback = profiler::RendererFallbackReason::UnderlapCaptureFailed;
                     }
                 }
                 Ok(RendererOutcome {
@@ -684,19 +739,42 @@ impl DirectXRenderer {
                     fallback,
                     present: profiler::RendererPresentKind::Present,
                     damage_rect: None,
-                    metrics,
+                    metrics: result.metrics,
                 })
             }
-            RenderPlan::Damage { damage } => {
-                let (metrics, mut rect) = self.draw_motion_damage(scene, damage)?;
-                self.present_dirty(&mut rect)?;
-                Ok(RendererOutcome {
-                    origin: profiler::RendererFrameOrigin::RetainedDamage,
-                    fallback: profiler::RendererFallbackReason::None,
-                    present: profiler::RendererPresentKind::Present1,
-                    damage_rect: Some(rect),
-                    metrics,
-                })
+            RenderPlan::Damage { damage, current } => {
+                match self.draw_motion_damage(scene, damage) {
+                    Ok((metrics, mut rect)) => {
+                        self.present_dirty(&mut rect)?;
+                        self.motion_damage_history.did_present_damage(current);
+                        Ok(RendererOutcome {
+                            origin: profiler::RendererFrameOrigin::RetainedDamage,
+                            fallback: profiler::RendererFallbackReason::None,
+                            present: profiler::RendererPresentKind::Present1,
+                            damage_rect: Some(rect),
+                            metrics,
+                        })
+                    }
+                    Err(error) => {
+                        log::warn!("motion-damage preparation failed; using full frame: {error:#}");
+                        self.invalidate_motion_damage();
+                        let result = self.draw_full_scene(
+                            scene,
+                            background_appearance,
+                            false,
+                            false,
+                            collect_metrics,
+                        )?;
+                        self.present()?;
+                        Ok(RendererOutcome {
+                            origin: profiler::RendererFrameOrigin::RetainedFull,
+                            fallback: profiler::RendererFallbackReason::DamagePathFailed,
+                            present: profiler::RendererPresentKind::Present,
+                            damage_rect: None,
+                            metrics: result.metrics,
+                        })
+                    }
+                }
             }
         }
     }
@@ -707,7 +785,8 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
         skip_immutable_uploads: bool,
         capture_underlap: bool,
-    ) -> Result<RendererMetrics> {
+        collect_metrics: bool,
+    ) -> Result<FullSceneResult> {
         let clear_color = match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -717,9 +796,13 @@ impl DirectXRenderer {
         let mut metrics = RendererMetrics::default();
         if !skip_immutable_uploads {
             self.upload_scene_buffers(scene)?;
-            metrics.uploads = immutable_upload_counts(scene);
-            metrics.uploaded_bytes = immutable_upload_bytes(scene);
+            if collect_metrics {
+                metrics.uploads = immutable_upload_counts(scene);
+                metrics.uploaded_bytes = immutable_upload_bytes(scene);
+            }
         }
+
+        let mut underlap_captured = false;
 
         let annotation = self
             .devices
@@ -732,71 +815,85 @@ impl DirectXRenderer {
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
                 PrimitiveBatch::Shadows(range) => {
-                    metrics.draw_calls += 1;
+                    metrics.draw_calls += u32::from(collect_metrics);
                     self.draw_shadows(range.start, range.len())
                 }
                 PrimitiveBatch::Quads(range) => {
-                    metrics.draw_calls += 1;
+                    metrics.draw_calls += u32::from(collect_metrics);
                     self.draw_quads(range.start, range.len())
                 }
                 PrimitiveBatch::Effects(range) => {
                     if capture_underlap {
-                        self.capture_motion_underlap()?;
+                        match self.capture_motion_underlap() {
+                            Ok(()) => underlap_captured = true,
+                            Err(error) => {
+                                log::warn!(
+                                    "motion underlap capture failed; using full frame: {error:#}"
+                                );
+                                self.invalidate_motion_damage();
+                            }
+                        }
                     }
-                    metrics.draw_calls += 1;
-                    metrics.effect_draw_calls += 1;
+                    metrics.draw_calls += u32::from(collect_metrics);
+                    metrics.effect_draw_calls += u32::from(collect_metrics);
                     self.draw_effects(range.start, range.len())
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    metrics.draw_calls += 2;
-                    metrics.uploads.paths = metrics
-                        .uploads
-                        .paths
-                        .saturating_add(paths.len() as u32);
-                    metrics.uploaded_bytes = metrics.uploaded_bytes.saturating_add(
-                        paths
-                            .iter()
-                            .map(|path| path.vertices.len() * size_of::<PathRasterizationSprite>())
-                            .sum::<usize>() as u64
-                            + if paths
-                                .first()
-                                .zip(paths.last())
-                                .is_some_and(|(first, last)| first.order == last.order)
-                            {
-                                (paths.len() * size_of::<PathSprite>()) as u64
-                            } else {
-                                size_of::<PathSprite>() as u64
-                            },
-                    );
+                    if collect_metrics {
+                        metrics.draw_calls += 2;
+                        metrics.uploads.paths = metrics
+                            .uploads
+                            .paths
+                            .saturating_add(paths.len() as u32);
+                        metrics.uploaded_bytes = metrics.uploaded_bytes.saturating_add(
+                            paths
+                                .iter()
+                                .map(|path| {
+                                    path.vertices.len() * size_of::<PathRasterizationSprite>()
+                                })
+                                .sum::<usize>() as u64
+                                + if paths
+                                    .first()
+                                    .zip(paths.last())
+                                    .is_some_and(|(first, last)| first.order == last.order)
+                                {
+                                    (paths.len() * size_of::<PathSprite>()) as u64
+                                } else {
+                                    size_of::<PathSprite>() as u64
+                                },
+                        );
+                    }
                     self.draw_paths_to_intermediate(paths)?;
                     self.draw_paths_from_intermediate(paths)
                 }
                 PrimitiveBatch::Underlines(range) => {
-                    metrics.draw_calls += 1;
+                    metrics.draw_calls += u32::from(collect_metrics);
                     self.draw_underlines(range.start, range.len())
                 }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                    metrics.draw_calls += 1;
+                    metrics.draw_calls += u32::from(collect_metrics);
                     self.draw_monochrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                    metrics.draw_calls += 1;
+                    metrics.draw_calls += u32::from(collect_metrics);
                     self.draw_subpixel_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                    metrics.draw_calls += 1;
+                    metrics.draw_calls += u32::from(collect_metrics);
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => {
-                    metrics.draw_calls = metrics.draw_calls.saturating_add(range.len() as u32);
-                    metrics.uploads.surfaces = metrics
-                        .uploads
-                        .surfaces
-                        .saturating_add(range.len() as u32);
-                    metrics.uploaded_bytes = metrics.uploaded_bytes.saturating_add(
-                        (range.len() * size_of::<PolychromeSprite>()) as u64,
-                    );
+                    if collect_metrics {
+                        metrics.draw_calls = metrics.draw_calls.saturating_add(range.len() as u32);
+                        metrics.uploads.surfaces = metrics
+                            .uploads
+                            .surfaces
+                            .saturating_add(range.len() as u32);
+                        metrics.uploaded_bytes = metrics.uploaded_bytes.saturating_add(
+                            (range.len() * size_of::<PolychromeSprite>()) as u64,
+                        );
+                    }
                     self.draw_surfaces(&scene.surfaces[range])
                 }
             }
@@ -816,7 +913,10 @@ impl DirectXRenderer {
                 )
             })?;
         }
-        Ok(metrics)
+        Ok(FullSceneResult {
+            metrics,
+            underlap_captured,
+        })
     }
 
     fn draw_motion_damage(
@@ -860,6 +960,11 @@ impl DirectXRenderer {
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             devices
+                .device
+                .GetDeviceRemovedReason()
+                .ok()
+                .context("motion underlap restore copy failed")?;
+            devices
                 .device_context
                 .RSSetState(&resources.scissor_rasterizer_state);
             devices.device_context.RSSetScissorRects(Some(&[rect]));
@@ -896,7 +1001,10 @@ impl DirectXRenderer {
                     .context("missing render target")?
                     .GetDesc(&mut descriptor)
             };
-            descriptor.BindFlags = 0;
+            // DEFAULT textures require a valid binding role on drivers that
+            // reject allocation-only resources. The snapshot is currently a
+            // copy source; SRV is the least-permissive supported role.
+            descriptor.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
             descriptor.CPUAccessFlags = 0;
             descriptor.MiscFlags = 0;
             let mut texture = None;
@@ -922,6 +1030,11 @@ impl DirectXRenderer {
             devices
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            devices
+                .device
+                .GetDeviceRemovedReason()
+                .ok()
+                .context("motion underlap copy failed")?;
         };
         Ok(())
     }
@@ -1893,6 +2006,95 @@ fn damage_rect(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> Option<
         right,
         bottom,
     })
+}
+
+#[cfg(test)]
+mod retained_motion_tests {
+    use super::{
+        Bounds, RetainedMotionDamage, RetainedMotionDamageFallback, ScaledPixels, damage_rect,
+        point, profiler, retained_damage_fallback, size,
+    };
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    #[test]
+    fn retained_damage_fallback_table() {
+        let eligible = Ok(RetainedMotionDamage {
+            bounds: bounds(1.0, 2.0, 3.0, 4.0),
+        });
+        let scene_rejection = Err(RetainedMotionDamageFallback::MultipleEffects);
+        for (name, motion_only, opaque, scene, coherent, underlap, expected) in [
+            ("eligible", true, true, eligible, true, true, None),
+            (
+                "ordinary-dirty",
+                false,
+                true,
+                eligible,
+                true,
+                true,
+                Some(profiler::RendererFallbackReason::NotMotionOnly),
+            ),
+            (
+                "non-opaque",
+                true,
+                false,
+                eligible,
+                true,
+                true,
+                Some(profiler::RendererFallbackReason::UnsupportedBackground),
+            ),
+            (
+                "scene",
+                true,
+                true,
+                scene_rejection,
+                true,
+                true,
+                Some(profiler::RendererFallbackReason::Scene(
+                    RetainedMotionDamageFallback::MultipleEffects,
+                )),
+            ),
+            (
+                "history",
+                true,
+                true,
+                eligible,
+                false,
+                true,
+                Some(profiler::RendererFallbackReason::HistoryUncertain),
+            ),
+            (
+                "underlap",
+                true,
+                true,
+                eligible,
+                true,
+                false,
+                Some(profiler::RendererFallbackReason::MissingUnderlap),
+            ),
+        ] {
+            assert_eq!(
+                retained_damage_fallback(motion_only, opaque, scene, coherent, underlap),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn present_and_scissor_damage_rect_expands_and_clips_to_viewport() {
+        let rect = damage_rect(bounds(-1.25, 2.25, 12.5, 9.5), 10, 10).unwrap();
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (0, 2, 10, 10)
+        );
+        assert!(damage_rect(bounds(20.0, 20.0, 4.0, 4.0), 10, 10).is_none());
+    }
 }
 
 #[derive(Clone, Copy)]

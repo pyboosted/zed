@@ -94,45 +94,57 @@ pub struct RetainedMotionDamage {
 /// [`Self::observe_retained_full`] after each fallback full replay, and may use
 /// [`Self::next_damage`] only when [`Self::is_coherent`] is true.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RetainedMotionDamageHistory {
-    previous: Option<Bounds<ScaledPixels>>,
-    coherent_back_buffers: usize,
+    buffer_bounds: Vec<Option<Bounds<ScaledPixels>>>,
+    next_buffer: usize,
 }
 
 impl RetainedMotionDamageHistory {
     /// Starts history for a newly drawn scene. Only the current flip-chain
     /// buffer is known to contain that scene.
-    pub fn begin_scene(&mut self, bounds: Bounds<ScaledPixels>) {
-        self.previous = Some(bounds);
-        self.coherent_back_buffers = 1;
+    pub fn begin_scene(&mut self, bounds: Bounds<ScaledPixels>, buffer_count: usize) {
+        self.buffer_bounds = vec![None; buffer_count];
+        if let Some(first) = self.buffer_bounds.first_mut() {
+            *first = Some(bounds);
+            self.next_buffer = 1 % buffer_count;
+        } else {
+            self.next_buffer = 0;
+        }
     }
 
     /// Records a full replay of the same retained scene into another buffer.
     pub fn observe_retained_full(&mut self, bounds: Bounds<ScaledPixels>, buffer_count: usize) {
-        if self.previous.is_none() {
-            self.begin_scene(bounds);
+        if self.buffer_bounds.len() != buffer_count || self.buffer_bounds.is_empty() {
+            self.begin_scene(bounds, buffer_count);
             return;
         }
-        self.previous = Some(bounds);
-        self.coherent_back_buffers = self
-            .coherent_back_buffers
-            .saturating_add(1)
-            .min(buffer_count);
+        self.buffer_bounds[self.next_buffer] = Some(bounds);
+        self.next_buffer = (self.next_buffer + 1) % buffer_count;
     }
 
     /// Returns whether every flip-chain buffer has received a full scene.
     pub fn is_coherent(&self, buffer_count: usize) -> bool {
-        buffer_count > 0 && self.previous.is_some() && self.coherent_back_buffers >= buffer_count
+        buffer_count > 0
+            && self.buffer_bounds.len() == buffer_count
+            && self.buffer_bounds.iter().all(Option::is_some)
     }
 
-    /// Returns the union of previous and current effect bounds and advances
-    /// history. Callers must establish coherent buffer history first.
-    pub fn next_damage(&mut self, current: Bounds<ScaledPixels>) -> Option<Bounds<ScaledPixels>> {
-        let previous = self.previous?;
-        let damage = previous.union(&current);
-        self.previous = Some(current);
-        Some(damage)
+    /// Returns the union of the bounds currently stored in the next
+    /// swap-chain buffer and the current effect bounds. This is intentionally
+    /// non-mutating: history advances only after a successful presentation.
+    pub fn next_damage(&self, current: Bounds<ScaledPixels>) -> Option<Bounds<ScaledPixels>> {
+        let previous = self.buffer_bounds.get(self.next_buffer)?.as_ref()?;
+        Some(previous.union(&current))
+    }
+
+    /// Records a successfully presented damage frame in the current buffer.
+    pub fn did_present_damage(&mut self, current: Bounds<ScaledPixels>) {
+        if self.buffer_bounds.is_empty() {
+            return;
+        }
+        self.buffer_bounds[self.next_buffer] = Some(current);
+        self.next_buffer = (self.next_buffer + 1) % self.buffer_bounds.len();
     }
 
     /// Invalidates all scene and swapchain history.
@@ -1247,49 +1259,138 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retained_motion_damage_rejects_interleaved_content() {
+    fn test_bounds(x: f32, y: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        )
+    }
+
+    fn eligible_motion_scene() -> Scene {
         let mut scene = Scene::default();
+        let bounds = test_bounds(10.0, 20.0);
         scene.effects.push(EffectQuad {
             order: 3,
             kind: 0,
-            bounds: Bounds::new(
-                point(ScaledPixels(10.0), ScaledPixels(20.0)),
-                size(ScaledPixels(16.0), ScaledPixels(16.0)),
-            ),
-            content_mask: ContentMask::default(),
+            bounds,
+            content_mask: ContentMask::from_bounds(bounds),
             ..Default::default()
         });
-        scene.quads.push(Quad {
+        scene
+    }
+
+    #[test]
+    fn retained_motion_damage_eligibility_table() {
+        let eligible = eligible_motion_scene();
+        assert_eq!(
+            eligible.retained_motion_damage(),
+            Ok(RetainedMotionDamage {
+                bounds: test_bounds(10.0, 20.0)
+            })
+        );
+
+        let mut clipped = eligible_motion_scene();
+        let clipped_bounds = Bounds::new(
+            point(ScaledPixels(14.0), ScaledPixels(24.0)),
+            size(ScaledPixels(4.0), ScaledPixels(5.0)),
+        );
+        clipped.effects[0].content_mask = ContentMask::from_bounds(clipped_bounds);
+        assert_eq!(
+            clipped.retained_motion_damage(),
+            Ok(RetainedMotionDamage {
+                bounds: clipped_bounds
+            })
+        );
+
+        let mut multiple = eligible_motion_scene();
+        multiple.effects.push(multiple.effects[0]);
+        let mut unsupported = eligible_motion_scene();
+        unsupported.effects[0].kind = 1;
+        let mut surface = eligible_motion_scene();
+        surface.surfaces.push(PaintSurface {
+            order: 1,
+            bounds: test_bounds(0.0, 0.0),
+            content_mask: ContentMask::from_bounds(test_bounds(0.0, 0.0)),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            image_buffer: crate::SurfaceBuffer::from_platform_surface((), 1, 1, None, None),
+        });
+        let mut interleaved = eligible_motion_scene();
+        interleaved.quads.push(Quad {
             order: 3,
             ..Default::default()
         });
 
-        assert_eq!(
-            scene.retained_motion_damage(),
-            Err(RetainedMotionDamageFallback::InterleavedOrder)
-        );
+        for (name, scene, expected) in [
+            (
+                "multiple",
+                multiple,
+                RetainedMotionDamageFallback::MultipleEffects,
+            ),
+            (
+                "unsupported",
+                unsupported,
+                RetainedMotionDamageFallback::UnsupportedEffect,
+            ),
+            (
+                "surface",
+                surface,
+                RetainedMotionDamageFallback::ExternalSurface,
+            ),
+            (
+                "interleaved",
+                interleaved,
+                RetainedMotionDamageFallback::InterleavedOrder,
+            ),
+        ] {
+            assert_eq!(scene.retained_motion_damage(), Err(expected), "{name}");
+        }
     }
 
     #[test]
-    fn retained_motion_history_unions_previous_and_current_bounds() {
-        let previous = Bounds::new(
-            point(ScaledPixels(10.0), ScaledPixels(20.0)),
-            size(ScaledPixels(16.0), ScaledPixels(16.0)),
-        );
-        let current = Bounds::new(
-            point(ScaledPixels(18.0), ScaledPixels(12.0)),
-            size(ScaledPixels(16.0), ScaledPixels(16.0)),
-        );
+    fn retained_motion_history_tracks_each_flip_chain_buffer() {
+        let p0 = test_bounds(0.0, 0.0);
+        let p1 = test_bounds(20.0, 0.0);
+        let p2 = test_bounds(40.0, 0.0);
+        let p3 = test_bounds(60.0, 0.0);
+        let p4 = test_bounds(80.0, 0.0);
         let mut history = RetainedMotionDamageHistory::default();
-        history.begin_scene(previous);
+        history.begin_scene(p0, 3);
         assert!(!history.is_coherent(3));
-        history.observe_retained_full(previous, 3);
-        history.observe_retained_full(previous, 3);
+        history.observe_retained_full(p0, 3);
+        history.observe_retained_full(p0, 3);
         assert!(history.is_coherent(3));
-        assert_eq!(history.next_damage(current), Some(previous.union(&current)));
+
+        assert_eq!(history.next_damage(p1), Some(p0.union(&p1)));
+        history.did_present_damage(p1);
+        assert_eq!(history.next_damage(p2), Some(p0.union(&p2)));
+        history.did_present_damage(p2);
+        assert_eq!(history.next_damage(p3), Some(p0.union(&p3)));
+        history.did_present_damage(p3);
+        assert_eq!(history.next_damage(p4), Some(p1.union(&p4)));
+    }
+
+    #[test]
+    fn retained_motion_history_invalidation_requires_full_rewarm() {
+        let p0 = test_bounds(0.0, 0.0);
+        let p1 = test_bounds(20.0, 0.0);
+        let p2 = test_bounds(40.0, 0.0);
+        let mut history = RetainedMotionDamageHistory::default();
+        history.begin_scene(p0, 3);
+        history.observe_retained_full(p0, 3);
+        history.observe_retained_full(p0, 3);
+        assert!(history.is_coherent(3));
+        assert_eq!(history.next_damage(p2), Some(p0.union(&p2)));
+        // Merely computing or attempting a damage frame must not advance the
+        // buffer cursor; only a successful Present1 may do so.
+        assert_eq!(history.next_damage(p1), Some(p0.union(&p1)));
+
         history.invalidate();
         assert!(!history.is_coherent(3));
-        assert_eq!(history.next_damage(current), None);
+        assert_eq!(history.next_damage(p1), None);
+        history.observe_retained_full(p0, 3);
+        history.observe_retained_full(p0, 3);
+        assert!(!history.is_coherent(3));
+        history.observe_retained_full(p0, 3);
+        assert!(history.is_coherent(3));
     }
 }
