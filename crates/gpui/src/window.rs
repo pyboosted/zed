@@ -10,16 +10,16 @@ use crate::{
     GpuSpecs, Hsla, InactiveWindowFramePolicy, InputHandler, IsZero, KeyBinding, KeyContext,
     KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformFrameRequester, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SurfaceBuffer, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, profiler, px, rems, size, transparent_black,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameRequester, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SurfaceBuffer, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -991,6 +991,10 @@ pub(crate) struct Frame {
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
+    /// `debug_bounds` in paint order, so a replayed paint range can carry
+    /// over exactly the entries it recorded (see `Window::reuse_paint`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) debug_bounds_log: Vec<(String, Bounds<Pixels>)>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1008,6 +1012,40 @@ pub(crate) struct PrepaintStateIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+impl PrepaintStateIndex {
+    /// `self`, recorded relative to a range that started at `from`, re-based
+    /// onto a replay of that range which started at `to`. Replays copy a
+    /// range contiguously and in order, so every nested index moves by the
+    /// same amount.
+    pub(crate) fn rebased(&self, from: &Self, to: &Self) -> Self {
+        fn shift(index: usize, from: usize, to: usize) -> usize {
+            index.wrapping_add(to).wrapping_sub(from)
+        }
+        Self {
+            hitboxes_index: shift(self.hitboxes_index, from.hitboxes_index, to.hitboxes_index),
+            tooltips_index: shift(self.tooltips_index, from.tooltips_index, to.tooltips_index),
+            deferred_draws_index: shift(
+                self.deferred_draws_index,
+                from.deferred_draws_index,
+                to.deferred_draws_index,
+            ),
+            dispatch_tree_index: shift(
+                self.dispatch_tree_index,
+                from.dispatch_tree_index,
+                to.dispatch_tree_index,
+            ),
+            accessed_element_states_index: shift(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .rebased(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
@@ -1018,6 +1056,59 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
+    #[cfg(any(test, feature = "test-support"))]
+    debug_bounds_index: usize,
+}
+
+impl PaintIndex {
+    /// See [`PrepaintStateIndex::rebased`].
+    pub(crate) fn rebased(&self, from: &Self, to: &Self) -> Self {
+        fn shift(index: usize, from: usize, to: usize) -> usize {
+            index.wrapping_add(to).wrapping_sub(from)
+        }
+        Self {
+            scene_index: shift(self.scene_index, from.scene_index, to.scene_index),
+            mouse_listeners_index: shift(
+                self.mouse_listeners_index,
+                from.mouse_listeners_index,
+                to.mouse_listeners_index,
+            ),
+            input_handlers_index: shift(
+                self.input_handlers_index,
+                from.input_handlers_index,
+                to.input_handlers_index,
+            ),
+            cursor_styles_index: shift(
+                self.cursor_styles_index,
+                from.cursor_styles_index,
+                to.cursor_styles_index,
+            ),
+            window_control_hitboxes_index: shift(
+                self.window_control_hitboxes_index,
+                from.window_control_hitboxes_index,
+                to.window_control_hitboxes_index,
+            ),
+            accessed_element_states_index: shift(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            tab_handle_index: shift(
+                self.tab_handle_index,
+                from.tab_handle_index,
+                to.tab_handle_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .rebased(&from.line_layout_index, &to.line_layout_index),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: shift(
+                self.debug_bounds_index,
+                from.debug_bounds_index,
+                to.debug_bounds_index,
+            ),
+        }
+    }
 }
 
 impl Frame {
@@ -1039,6 +1130,8 @@ impl Frame {
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_log: Vec::new(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             next_inspector_instance_ids: FxHashMap::default(),
@@ -1067,6 +1160,7 @@ impl Frame {
         #[cfg(any(test, feature = "test-support"))]
         {
             self.debug_bounds.clear();
+            self.debug_bounds_log.clear();
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1198,6 +1292,10 @@ pub struct Window {
     input_latency_tracker: InputLatencyTracker,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    /// While set, a cached view whose bounds only moved replays its cached
+    /// prepaint and paint at the new position instead of re-rendering
+    /// (`Window::set_cached_view_translation_replay`).
+    pub(crate) cached_view_translation_replay: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1863,9 +1961,7 @@ impl Window {
                 // next-frame callbacks, an active retained-motion cadence, or
                 // sustained high-rate input. Otherwise the vsync loop goes
                 // quiet until the next invalidation.
-                let motion_active = motion_presentation
-                    .borrow()
-                    .schedule_active(Instant::now());
+                let motion_active = motion_presentation.borrow().schedule_active(Instant::now());
                 if invalidator.is_dirty()
                     || !next_frame_callbacks.borrow().is_empty()
                     || motion_active
@@ -1934,7 +2030,15 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.hovered.set(active);
-                        window.refresh();
+                        // While cached views replay a canvas motion, hover
+                        // state is moot (the caller covers the moving content
+                        // and refreshes when the motion ends); a full refresh
+                        // here would make every moved view re-render. Posted
+                        // pointer input in particular toggles the hover status
+                        // on every move because the real cursor is elsewhere.
+                        if !window.cached_view_translation_replay {
+                            window.refresh();
+                        }
                     })
                     .log_err();
             }
@@ -2071,6 +2175,7 @@ impl Window {
             input_latency_tracker: InputLatencyTracker::new()?,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
+            cached_view_translation_replay: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -2175,6 +2280,41 @@ impl<P: Clone + Debug + Default + PartialEq> ContentMask<P> {
         };
         self.rounded_clip_count += 1;
     }
+}
+
+impl<P> ContentMask<P>
+where
+    P: Clone + Debug + Default + PartialEq + PartialOrd + Copy + std::ops::Add<Output = P>,
+{
+    /// The mask moved by `offset`, except for the parts that fully contained
+    /// `view_bounds`: those come from ancestors the moved view is still
+    /// inside of (a viewport clip) and must not move with it.
+    pub(crate) fn translated_within(&self, offset: Point<P>, view_bounds: &Bounds<P>) -> Self {
+        let mut mask = *self;
+        if !bounds_encloses(&mask.bounds, view_bounds) {
+            mask.bounds = mask.bounds + offset;
+        }
+        for clip in mask
+            .rounded_clips
+            .iter_mut()
+            .take(mask.rounded_clip_count as usize)
+        {
+            if !bounds_encloses(&clip.bounds, view_bounds) {
+                clip.bounds = clip.bounds + offset;
+            }
+        }
+        mask
+    }
+}
+
+pub(crate) fn bounds_encloses<P>(outer: &Bounds<P>, inner: &Bounds<P>) -> bool
+where
+    P: Clone + Debug + Default + PartialEq + PartialOrd + Copy + std::ops::Add<Output = P>,
+{
+    outer.origin.x <= inner.origin.x
+        && outer.origin.y <= inner.origin.y
+        && outer.origin.x + outer.size.width >= inner.origin.x + inner.size.width
+        && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height
 }
 
 impl ContentMask<Pixels> {
@@ -2525,6 +2665,30 @@ impl Window {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
         }
+    }
+
+    /// Lets cached views whose bounds merely moved (same size, same content
+    /// mask, fully inside that mask before and after, no deferred draws)
+    /// replay their cached prepaint and paint at the new position instead
+    /// of re-rendering. Meant for a canvas pan or camera animation, where
+    /// dozens of retained views move together every frame; the caller turns
+    /// it off and calls [`Window::refresh`] when the motion ends, since the
+    /// replayed element state (input handler bounds, scroll geometry) keeps
+    /// the pre-motion positions until a real render.
+    pub fn set_cached_view_translation_replay(&mut self, enabled: bool) {
+        self.cached_view_translation_replay = enabled;
+    }
+
+    /// Whether [`Window::set_cached_view_translation_replay`] is on.
+    pub fn cached_view_translation_replay(&self) -> bool {
+        self.cached_view_translation_replay
+    }
+
+    pub(crate) fn prepaint_range_has_deferred_draws(
+        &self,
+        range: &Range<PrepaintStateIndex>,
+    ) -> bool {
+        range.end.deferred_draws_index > range.start.deferred_draws_index
     }
 
     /// Close this window.
@@ -3780,7 +3944,7 @@ impl Window {
                     });
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
-                    self.reuse_prepaint(prepaint_range);
+                    self.reuse_prepaint(prepaint_range, Point::default(), Bounds::default());
                 }
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
@@ -3823,7 +3987,11 @@ impl Window {
                     })
                 })
             } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
+                self.reuse_paint(
+                    deferred_draw.paint_range.clone(),
+                    Point::default(),
+                    Bounds::default(),
+                );
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -3850,11 +4018,35 @@ impl Window {
         }
     }
 
-    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+    /// Replays a prepaint range of the rendered frame. A non-zero `offset`
+    /// moves the replayed hitboxes; `view_bounds` are the replayed view's
+    /// bounds when the range was recorded (see
+    /// [`Window::set_cached_view_translation_replay`]).
+    pub(crate) fn reuse_prepaint(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+        offset: Point<Pixels>,
+        view_bounds: Bounds<Pixels>,
+    ) {
+        let translated = offset != Point::default();
+        let replay_start = self.prepaint_index();
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
-                .cloned(),
+                .map(|hitbox| {
+                    if translated {
+                        Hitbox {
+                            id: hitbox.id,
+                            bounds: hitbox.bounds + offset,
+                            content_mask: hitbox
+                                .content_mask
+                                .translated_within(offset, &view_bounds),
+                            behavior: hitbox.behavior,
+                        }
+                    } else {
+                        hitbox.clone()
+                    }
+                }),
         );
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
@@ -3868,8 +4060,9 @@ impl Window {
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
         );
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        self.text_system.reuse_layouts(
+            range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+        );
 
         let reused_subtree = self.next_frame.dispatch_tree.reuse_subtree(
             range.start.dispatch_tree_index..range.end.dispatch_tree_index,
@@ -3899,6 +4092,34 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
         );
+
+        // Cached views nested in the replayed range were not visited: their
+        // own replay ranges still describe the frame this range was recorded
+        // in. Re-base them so they stay valid when their parent later
+        // re-renders without forcing them (see `ViewElement::prepaint`).
+        let nested = self.rendered_frame.accessed_element_states
+            [range.start.accessed_element_states_index..range.end.accessed_element_states_index]
+            .iter()
+            .filter(|(_, type_id)| crate::view::is_cached_view_state(*type_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in nested {
+            if let Some(state) = self.next_frame.element_states.get_mut(&key) {
+                crate::view::rebase_cached_view_prepaint(
+                    &mut *state.inner,
+                    &range.start,
+                    &replay_start,
+                    offset,
+                );
+            } else if let Some(state) = self.rendered_frame.element_states.get_mut(&key) {
+                crate::view::rebase_cached_view_prepaint(
+                    &mut *state.inner,
+                    &range.start,
+                    &replay_start,
+                    offset,
+                );
+            }
+        }
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
@@ -3911,10 +4132,21 @@ impl Window {
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: self.next_frame.debug_bounds_log.len(),
         }
     }
 
-    pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+    /// Replays a paint range of the rendered frame; see
+    /// [`Window::reuse_prepaint`] for `offset` and `view_bounds`.
+    pub(crate) fn reuse_paint(
+        &mut self,
+        range: Range<PaintIndex>,
+        offset: Point<Pixels>,
+        view_bounds: Bounds<Pixels>,
+    ) {
+        let translated = offset != Point::default();
+        let replay_start = self.paint_index();
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -3937,7 +4169,23 @@ impl Window {
             self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
                 ..range.end.window_control_hitboxes_index]
                 .iter()
-                .cloned(),
+                .map(|(area, hitbox)| {
+                    if translated {
+                        (
+                            *area,
+                            Hitbox {
+                                id: hitbox.id,
+                                bounds: hitbox.bounds + offset,
+                                content_mask: hitbox
+                                    .content_mask
+                                    .translated_within(offset, &view_bounds),
+                                behavior: hitbox.behavior,
+                            },
+                        )
+                    } else {
+                        (*area, hitbox.clone())
+                    }
+                }),
         );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
@@ -3950,12 +4198,61 @@ impl Window {
                 [range.start.tab_handle_index..range.end.tab_handle_index],
         );
 
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
+        self.text_system.reuse_layouts(
+            range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
         );
+        if translated {
+            let scale_factor = self.scale_factor();
+            self.next_frame.scene.replay_translated(
+                range.start.scene_index..range.end.scene_index,
+                &self.rendered_frame.scene,
+                offset.scale(scale_factor),
+                view_bounds.scale(scale_factor),
+            );
+        } else {
+            self.next_frame.scene.replay(
+                range.start.scene_index..range.end.scene_index,
+                &self.rendered_frame.scene,
+            );
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            // Debug bounds are recorded at paint and cleared per frame; a
+            // replayed range painted nothing, so carry over exactly the
+            // entries it recorded (moved along for a translated replay).
+            let carried = self.rendered_frame.debug_bounds_log
+                [range.start.debug_bounds_index..range.end.debug_bounds_index]
+                .iter()
+                .map(|(name, bounds)| (name.clone(), *bounds + offset))
+                .collect::<Vec<_>>();
+            for (name, bounds) in carried {
+                self.next_frame.debug_bounds.insert(name.clone(), bounds);
+                self.next_frame.debug_bounds_log.push((name, bounds));
+            }
+        }
+        let nested = self.rendered_frame.accessed_element_states
+            [range.start.accessed_element_states_index..range.end.accessed_element_states_index]
+            .iter()
+            .filter(|(_, type_id)| crate::view::is_cached_view_state(*type_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in nested {
+            if let Some(state) = self.next_frame.element_states.get_mut(&key) {
+                crate::view::rebase_cached_view_paint(
+                    &mut *state.inner,
+                    &range.start,
+                    &replay_start,
+                    offset,
+                );
+            } else if let Some(state) = self.rendered_frame.element_states.get_mut(&key) {
+                crate::view::rebase_cached_view_paint(
+                    &mut *state.inner,
+                    &range.start,
+                    &replay_start,
+                    offset,
+                );
+            }
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.

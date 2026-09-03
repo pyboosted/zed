@@ -1,7 +1,8 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle, WeakEntity,
+    Pixels, Point, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle,
+    WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -287,12 +288,57 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// Offset the cached paint range must be replayed at (the view moved
+    /// since it was painted; see `Window::set_cached_view_translation_replay`).
+    pending_translation: Point<Pixels>,
+    /// The view's bounds when the cached paint range was recorded.
+    painted_bounds: Bounds<Pixels>,
 }
 
 struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+}
+
+/// Whether an element-state type id is a cached view's state.
+pub(crate) fn is_cached_view_state(type_id: TypeId) -> bool {
+    type_id == TypeId::of::<ViewElementState>()
+}
+
+/// Re-bases a nested cached view's prepaint range after the range that
+/// contains it was replayed starting at `to` instead of `from`; a non-zero
+/// `offset` means the replay was translated and moves the cached bounds.
+pub(crate) fn rebase_cached_view_prepaint(
+    state: &mut dyn std::any::Any,
+    from: &PrepaintStateIndex,
+    to: &PrepaintStateIndex,
+    offset: Point<Pixels>,
+) {
+    if let Some(Some(state)) = state.downcast_mut::<Option<ViewElementState>>() {
+        state.prepaint_range = state.prepaint_range.start.rebased(from, to)
+            ..state.prepaint_range.end.rebased(from, to);
+        if offset != Point::default() {
+            state.cache_key.bounds = state.cache_key.bounds + offset;
+        }
+    }
+}
+
+/// Paint-side counterpart of [`rebase_cached_view_prepaint`].
+pub(crate) fn rebase_cached_view_paint(
+    state: &mut dyn std::any::Any,
+    from: &PaintIndex,
+    to: &PaintIndex,
+    offset: Point<Pixels>,
+) {
+    if let Some(Some(state)) = state.downcast_mut::<Option<ViewElementState>>() {
+        state.paint_range =
+            state.paint_range.start.rebased(from, to)..state.paint_range.end.rebased(from, to);
+        if offset != Point::default() {
+            state.painted_bounds = state.painted_bounds + offset;
+            state.pending_translation = Point::default();
+        }
+    }
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -384,23 +430,52 @@ impl<V: View> Element for ViewElement<V> {
                         let text_style = window.text_style();
 
                         if let Some(mut element_state) = element_state
-                            && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
-                            let prepaint_start = window.prepaint_index();
-                            window.reuse_prepaint(element_state.prepaint_range.clone());
-                            cx.entities
-                                .extend_accessed(&element_state.accessed_entities);
-                            let prepaint_end = window.prepaint_index();
-                            element_state.prepaint_range = prepaint_start..prepaint_end;
+                            let previous_bounds = element_state.cache_key.bounds;
+                            let translation = bounds.origin - previous_bounds.origin;
+                            let replayable = translation == Point::default()
+                                || (window.cached_view_translation_replay
+                                    && previous_bounds.size == bounds.size
+                                    && crate::window::bounds_encloses(
+                                        &content_mask.bounds,
+                                        &previous_bounds,
+                                    )
+                                    && crate::window::bounds_encloses(
+                                        &content_mask.bounds,
+                                        &bounds,
+                                    )
+                                    && !window.prepaint_range_has_deferred_draws(
+                                        &element_state.prepaint_range,
+                                    ));
+                            if replayable {
+                                let prepaint_start = window.prepaint_index();
+                                window.reuse_prepaint(
+                                    element_state.prepaint_range.clone(),
+                                    translation,
+                                    previous_bounds,
+                                );
+                                cx.entities
+                                    .extend_accessed(&element_state.accessed_entities);
+                                let prepaint_end = window.prepaint_index();
+                                element_state.prepaint_range = prepaint_start..prepaint_end;
+                                element_state.cache_key.bounds = bounds;
+                                element_state.pending_translation = translation;
 
-                            return (None, element_state);
+                                return (None, element_state);
+                            }
                         }
 
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        // A cached view that re-renders because it is dirty
+                        // (or moved without translation replay) does not force
+                        // the cached views nested in it to re-render: they keep
+                        // their own dirtiness and cache keys. Only
+                        // `Window::refresh` sets `refreshing` for the whole
+                        // tree. Before, a dirty pane body re-rendered every
+                        // other body of its frame through this flag.
                         let prepaint_start = window.prepaint_index();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                             let mut element = self
@@ -415,7 +490,6 @@ impl<V: View> Element for ViewElement<V> {
                         });
 
                         let prepaint_end = window.prepaint_index();
-                        window.refreshing = refreshing;
 
                         (
                             Some(element),
@@ -428,6 +502,8 @@ impl<V: View> Element for ViewElement<V> {
                                     content_mask,
                                     text_style,
                                 },
+                                pending_translation: Point::default(),
+                                painted_bounds: bounds,
                             },
                         )
                     },
@@ -468,11 +544,17 @@ impl<V: View> Element for ViewElement<V> {
                             let paint_start = window.paint_index();
 
                             if let Some(element) = element {
-                                let refreshing = mem::replace(&mut window.refreshing, true);
                                 element.paint(window, cx);
-                                window.refreshing = refreshing;
+                                element_state.painted_bounds = element_state.cache_key.bounds;
                             } else {
-                                window.reuse_paint(element_state.paint_range.clone());
+                                let translation = mem::take(&mut element_state.pending_translation);
+                                let painted_bounds = element_state.painted_bounds;
+                                window.reuse_paint(
+                                    element_state.paint_range.clone(),
+                                    translation,
+                                    painted_bounds,
+                                );
+                                element_state.painted_bounds = painted_bounds + translation;
                             }
 
                             let paint_end = window.paint_index();

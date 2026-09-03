@@ -422,6 +422,31 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_by_hash_index: usize,
 }
 
+impl LineLayoutIndex {
+    /// `self`, recorded relative to a range that started at `from`, re-based
+    /// onto a replay of that range which started at `to`.
+    pub(crate) fn rebased(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            lines_index: self
+                .lines_index
+                .wrapping_add(to.lines_index)
+                .wrapping_sub(from.lines_index),
+            wrapped_lines_index: self
+                .wrapped_lines_index
+                .wrapping_add(to.wrapped_lines_index)
+                .wrapping_sub(from.wrapped_lines_index),
+            lines_by_hash_index: self
+                .lines_by_hash_index
+                .wrapping_add(to.lines_by_hash_index)
+                .wrapping_sub(from.lines_by_hash_index),
+            wrapped_lines_by_hash_index: self
+                .wrapped_lines_by_hash_index
+                .wrapping_add(to.wrapped_lines_by_hash_index)
+                .wrapping_sub(from.wrapped_lines_by_hash_index),
+        }
+    }
+}
+
 impl LineLayoutCache {
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         Self {

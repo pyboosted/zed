@@ -317,6 +317,32 @@ impl Scene {
         }
     }
 
+    /// [`Scene::replay`] with every replayed primitive moved by `offset`: a
+    /// cached view replayed at a new position (see
+    /// `Window::reuse_paint`). `view_bounds` are the view's bounds when the
+    /// range was painted; content masks that fully contained them belong to
+    /// ancestors the view is still inside of and stay where they are, the
+    /// others clip the view's own content and move with it.
+    pub fn replay_translated(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        offset: Point<ScaledPixels>,
+        view_bounds: Bounds<ScaledPixels>,
+    ) {
+        for operation in &prev_scene.paint_operations[range] {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let mut primitive = primitive.clone();
+                    primitive.translate(offset, &view_bounds);
+                    self.insert_primitive(primitive);
+                }
+                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds + offset),
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
     pub fn finish(&mut self) {
         // Primitives arrive in paint order, so the per-kind vectors are
         // usually already ordered; a full stable sort of every kind on every
@@ -474,6 +500,65 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    /// Moves the primitive by `offset`; see [`Scene::replay_translated`].
+    pub(crate) fn translate(
+        &mut self,
+        offset: Point<ScaledPixels>,
+        view_bounds: &Bounds<ScaledPixels>,
+    ) {
+        match self {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = shadow.bounds + offset;
+                shadow.element_bounds = shadow.element_bounds + offset;
+                shadow.content_mask = shadow.content_mask.translated_within(offset, view_bounds);
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = quad.bounds + offset;
+                quad.content_mask = quad.content_mask.translated_within(offset, view_bounds);
+            }
+            Primitive::Effect(effect) => {
+                effect.instance.bounds = effect.instance.bounds + offset;
+                effect.instance.content_mask = effect
+                    .instance
+                    .content_mask
+                    .translated_within(offset, view_bounds);
+            }
+            Primitive::Path(path) => {
+                path.bounds = path.bounds + offset;
+                path.content_mask = path.content_mask.translated_within(offset, view_bounds);
+                path.start = path.start + offset;
+                path.current = path.current + offset;
+                for vertex in &mut path.vertices {
+                    vertex.xy_position = vertex.xy_position + offset;
+                    vertex.content_mask =
+                        vertex.content_mask.translated_within(offset, view_bounds);
+                }
+            }
+            Primitive::Underline(underline) => {
+                underline.bounds = underline.bounds + offset;
+                underline.content_mask = underline
+                    .content_mask
+                    .translated_within(offset, view_bounds);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = sprite.bounds + offset;
+                sprite.content_mask = sprite.content_mask.translated_within(offset, view_bounds);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = sprite.bounds + offset;
+                sprite.content_mask = sprite.content_mask.translated_within(offset, view_bounds);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = sprite.bounds + offset;
+                sprite.content_mask = sprite.content_mask.translated_within(offset, view_bounds);
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = surface.bounds + offset;
+                surface.content_mask = surface.content_mask.translated_within(offset, view_bounds);
+            }
+        }
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
