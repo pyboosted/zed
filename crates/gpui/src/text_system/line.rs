@@ -97,6 +97,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            1.0,
             window,
             cx,
         )?;
@@ -122,6 +123,69 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            1.0,
+            window,
+            cx,
+        )?;
+
+        Ok(())
+    }
+
+    /// Paints the line as if it had been shaped at `font_size * scale`.
+    ///
+    /// Glyph advances, decorations and the rasterization size are all scaled,
+    /// so a line shaped once at a canonical size can be painted at any visual
+    /// scale without re-shaping. `line_height` is the target (already scaled)
+    /// line height. Geometry queries on the line (`x_for_index`,
+    /// `closest_index_for_x`, `width`) stay in the canonical space; callers
+    /// convert by `scale`.
+    pub fn paint_scaled(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        scale: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        paint_line(
+            origin,
+            &self.layout,
+            line_height,
+            align,
+            align_width,
+            &self.decoration_runs,
+            &[],
+            scale,
+            window,
+            cx,
+        )?;
+
+        Ok(())
+    }
+
+    /// Scaled counterpart of [`ShapedLine::paint_background`]; see
+    /// [`ShapedLine::paint_scaled`].
+    pub fn paint_background_scaled(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        scale: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        paint_line_background(
+            origin,
+            &self.layout,
+            line_height,
+            align,
+            align_width,
+            &self.decoration_runs,
+            &[],
+            scale,
             window,
             cx,
         )?;
@@ -293,6 +357,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            1.0,
             window,
             cx,
         )?;
@@ -323,6 +388,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            1.0,
             window,
             cx,
         )?;
@@ -339,19 +405,23 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    scale: f32,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
     let line_bounds = Bounds::new(
         origin,
         size(
-            layout.width,
+            layout.width * scale,
             line_height * (wrap_boundaries.len() as f32 + 1.),
         ),
     );
     window.paint_layer(line_bounds, |window| {
-        let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
-        let baseline_offset = point(px(0.), padding_top + layout.ascent);
+        let ascent = layout.ascent * scale;
+        let descent = layout.descent * scale;
+        let font_size = layout.font_size * scale;
+        let padding_top = (line_height - ascent - descent) / 2.;
+        let baseline_offset = point(px(0.), padding_top + ascent);
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
@@ -362,10 +432,11 @@ fn paint_line(
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,
-                align_width.unwrap_or(layout.width),
+                align_width.unwrap_or(layout.width * scale),
                 px(0.0),
                 &align,
                 layout,
+                scale,
                 wraps.peek(),
             ),
             origin.y,
@@ -374,10 +445,12 @@ fn paint_line(
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_size = text_system
+                .bounding_box(run.font_id, layout.font_size * scale)
+                .size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
-                glyph_origin.x += glyph.position.x - prev_glyph_position.x;
+                glyph_origin.x += (glyph.position.x - prev_glyph_position.x) * scale;
                 if glyph_ix == 0 && run_ix == 0 {
                     first_glyph_x = glyph_origin.x;
                 }
@@ -421,10 +494,11 @@ fn paint_line(
 
                     glyph_origin.x = aligned_origin_x(
                         origin,
-                        align_width.unwrap_or(layout.width),
+                        align_width.unwrap_or(layout.width * scale),
                         glyph.position.x,
                         &align,
                         layout,
+                        scale,
                         wraps.peek(),
                     );
                     glyph_origin.y += line_height;
@@ -455,11 +529,11 @@ fn paint_line(
                             current_underline.get_or_insert((
                                 point(
                                     glyph_origin.x,
-                                    glyph_origin.y + baseline_offset.y + (layout.descent * 0.618),
+                                    glyph_origin.y + baseline_offset.y + (descent * 0.618),
                                 ),
                                 UnderlineStyle {
                                     color: Some(run_underline.color.unwrap_or(style_run.color)),
-                                    thickness: run_underline.thickness,
+                                    thickness: run_underline.thickness * scale,
                                     wavy: run_underline.wavy,
                                 },
                             ));
@@ -473,12 +547,11 @@ fn paint_line(
                             current_strikethrough.get_or_insert((
                                 point(
                                     glyph_origin.x,
-                                    glyph_origin.y
-                                        + (((layout.ascent * 0.5) + baseline_offset.y) * 0.5),
+                                    glyph_origin.y + (((ascent * 0.5) + baseline_offset.y) * 0.5),
                                 ),
                                 StrikethroughStyle {
                                     color: Some(run_strikethrough.color.unwrap_or(style_run.color)),
-                                    thickness: run_strikethrough.thickness,
+                                    thickness: run_strikethrough.thickness * scale,
                                 },
                             ));
                         }
@@ -523,20 +596,20 @@ fn paint_line(
 
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
-                    let vertical_offset = point(px(0.0), glyph.position.y);
+                    let vertical_offset = point(px(0.0), glyph.position.y * scale);
                     if glyph.is_emoji {
                         window.paint_emoji(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            font_size,
                         )?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            font_size,
                             color,
                         )?;
                     }
@@ -544,11 +617,11 @@ fn paint_line(
             }
         }
 
-        let mut last_line_end_x = first_glyph_x + layout.width;
+        let mut last_line_end_x = first_glyph_x + layout.width * scale;
         if let Some(boundary) = wrap_boundaries.last() {
             let run = &layout.runs[boundary.run_ix];
             let glyph = &run.glyphs[boundary.glyph_ix];
-            last_line_end_x -= glyph.position.x;
+            last_line_end_x -= glyph.position.x * scale;
         }
 
         if let Some((mut underline_start, underline_style)) = current_underline.take() {
@@ -585,13 +658,14 @@ fn paint_line_background(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    scale: f32,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
     let line_bounds = Bounds::new(
         origin,
         size(
-            layout.width,
+            layout.width * scale,
             line_height * (wrap_boundaries.len() as f32 + 1.),
         ),
     );
@@ -604,10 +678,11 @@ fn paint_line_background(
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,
-                align_width.unwrap_or(layout.width),
+                align_width.unwrap_or(layout.width * scale),
                 px(0.0),
                 &align,
                 layout,
+                scale,
                 wraps.peek(),
             ),
             origin.y,
@@ -615,10 +690,12 @@ fn paint_line_background(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_size = text_system
+                .bounding_box(run.font_id, layout.font_size * scale)
+                .size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
-                glyph_origin.x += glyph.position.x - prev_glyph_position.x;
+                glyph_origin.x += (glyph.position.x - prev_glyph_position.x) * scale;
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
@@ -644,10 +721,11 @@ fn paint_line_background(
 
                     glyph_origin.x = aligned_origin_x(
                         origin,
-                        align_width.unwrap_or(layout.width),
+                        align_width.unwrap_or(layout.width * scale),
                         glyph.position.x,
                         &align,
                         layout,
+                        scale,
                         wraps.peek(),
                     );
                     glyph_origin.y += line_height;
@@ -702,11 +780,11 @@ fn paint_line_background(
             }
         }
 
-        let mut last_line_end_x = origin.x + layout.width;
+        let mut last_line_end_x = origin.x + layout.width * scale;
         if let Some(boundary) = wrap_boundaries.last() {
             let run = &layout.runs[boundary.run_ix];
             let glyph = &run.glyphs[boundary.glyph_ix];
-            last_line_end_x -= glyph.position.x;
+            last_line_end_x -= glyph.position.x * scale;
         }
 
         if let Some((mut background_origin, background_color)) = current_background.take() {
@@ -732,6 +810,7 @@ fn aligned_origin_x(
     last_glyph_x: Pixels,
     align: &TextAlign,
     layout: &LineLayout,
+    scale: f32,
     wrap_boundary: Option<&&WrapBoundary>,
 ) -> Pixels {
     let end_of_line = if let Some(WrapBoundary { run_ix, glyph_ix }) = wrap_boundary {
@@ -740,7 +819,7 @@ fn aligned_origin_x(
         layout.width
     };
 
-    let line_width = end_of_line - last_glyph_x;
+    let line_width = (end_of_line - last_glyph_x) * scale;
 
     match align {
         TextAlign::Left => origin.x,
