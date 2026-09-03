@@ -1493,6 +1493,9 @@ impl WindowsWindowInner {
 
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
+        // A gesture is starting; the first outputs arrive only once the
+        // update manager is polled from a draw.
+        self.state.frame_requester.request_frame();
         None
     }
 
@@ -1505,10 +1508,11 @@ impl WindowsWindowInner {
             }
             // Validate the region so a nested message pump doesn't keep
             // re-dispatching WM_PAINT for the still-invalid region in a busy
-            // loop until the in-progress draw unwinds. The vsync thread
-            // re-invalidates every window on each vsync (see
-            // `begin_vsync_thread`), so the deferred frame still gets drawn,
-            // at most one vsync late.
+            // loop until the in-progress draw unwinds, and ask the vsync
+            // thread (see `begin_vsync_thread`) to invalidate this window
+            // again, so the deferred frame still gets drawn, at most one
+            // vsync late.
+            self.state.frame_requester.request_frame();
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             return Some(0);
         };
@@ -1518,6 +1522,10 @@ impl WindowsWindowInner {
 
         let events = self.state.direct_manipulation.drain_events();
         if !events.is_empty() {
+            // DirectManipulation only produces events when polled from a
+            // draw; keep the vsync loop alive while a gesture or inertia is
+            // still emitting them.
+            self.state.frame_requester.request_frame();
             if let Some(mut func) = self.state.callbacks.input.take() {
                 for event in events {
                     func(event);

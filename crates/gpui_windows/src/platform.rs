@@ -21,7 +21,14 @@ use windows::{
         Foundation::*,
         Graphics::{Direct3D11::ID3D11Device, Gdi::*},
         Security::Credentials::*,
-        System::{Com::*, LibraryLoader::*, Ole::*, Power::*, SystemInformation::*},
+        System::{
+            Com::*,
+            LibraryLoader::*,
+            Ole::*,
+            Power::*,
+            SystemInformation::*,
+            Threading::{CreateEventW, SetEvent, WaitForSingleObject},
+        },
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
     core::*,
@@ -30,9 +37,75 @@ use windows::{
 use crate::*;
 use gpui::*;
 
+/// One entry per open window for the vsync thread: the window handle and the
+/// frame requester shared with gpui (`WindowsWindowState::frame_requester`).
+type FrameRequestEntry = (SafeHwnd, Arc<WindowsFrameRequester>);
+
+/// Auto-reset event the vsync thread parks on while no window wants a frame.
+/// Process-wide: one vsync thread serves every window.
+struct VsyncWake(HANDLE);
+
+unsafe impl Send for VsyncWake {}
+unsafe impl Sync for VsyncWake {}
+
+impl VsyncWake {
+    fn get() -> Option<&'static VsyncWake> {
+        static WAKE: std::sync::OnceLock<Option<VsyncWake>> = std::sync::OnceLock::new();
+        WAKE.get_or_init(|| unsafe {
+            CreateEventW(None, false, false, None)
+                .log_err()
+                .map(VsyncWake)
+        })
+        .as_ref()
+    }
+
+    fn signal(&self) {
+        unsafe {
+            let _ = SetEvent(self.0);
+        }
+    }
+
+    /// Blocks until signalled or `timeout` elapses.
+    fn wait(&self, timeout: std::time::Duration) {
+        let millis = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        unsafe {
+            let _ = WaitForSingleObject(self.0, millis);
+        }
+    }
+}
+
+/// Per-window frame request shared with gpui: a flag the vsync thread takes
+/// once per vsync, plus a wake-up for a parked vsync thread.
+pub(crate) struct WindowsFrameRequester {
+    wants_frame: AtomicBool,
+}
+
+impl WindowsFrameRequester {
+    pub(crate) fn new() -> Self {
+        Self {
+            wants_frame: AtomicBool::new(true),
+        }
+    }
+
+    /// Takes the pending request, if any.
+    fn take(&self) -> bool {
+        self.wants_frame.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl PlatformFrameRequester for WindowsFrameRequester {
+    fn request_frame(&self) {
+        self.wants_frame.store(true, Ordering::Release);
+        if let Some(wake) = VsyncWake::get() {
+            wake.signal();
+        }
+    }
+}
+
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    frame_requests: Arc<RwLock<SmallVec<[FrameRequestEntry; 4]>>>,
     // The below members will never change throughout the entire lifecycle of the app.
     headless: bool,
     icon: HICON,
@@ -55,6 +128,7 @@ pub struct WindowsPlatform {
 struct WindowsPlatformInner {
     state: WindowsPlatformState,
     raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    frame_requests: std::sync::Weak<RwLock<SmallVec<[FrameRequestEntry; 4]>>>,
     // The below members will never change throughout the entire lifecycle of the app.
     validation_number: usize,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
@@ -211,11 +285,14 @@ impl WindowsPlatform {
             rand::random::<u32>() as usize
         };
         let raw_window_handles = Arc::new(RwLock::new(SmallVec::new()));
+        let frame_requests: Arc<RwLock<SmallVec<[FrameRequestEntry; 4]>>> =
+            Arc::new(RwLock::new(SmallVec::new()));
 
         register_platform_window_class();
         let mut context = PlatformWindowCreateContext {
             inner: None,
             raw_window_handles: Arc::downgrade(&raw_window_handles),
+            frame_requests: Arc::downgrade(&frame_requests),
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
@@ -271,6 +348,7 @@ impl WindowsPlatform {
             inner,
             handle,
             raw_window_handles,
+            frame_requests,
             headless,
             icon,
             background_executor,
@@ -394,14 +472,31 @@ impl WindowsPlatform {
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
+        let frame_requests = Arc::downgrade(&self.frame_requests);
         let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
 
         std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
+                const VSYNC_SAFETY_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+                // After this many vsyncs with no request the thread parks on
+                // the wake event instead of waiting for vsync, so an idle app
+                // does not wake 240 times a second just to find nothing to do.
+                const IDLE_VSYNCS_BEFORE_PARK: u32 = 4;
                 let vsync_provider = VSyncProvider::new();
+                let wake = VsyncWake::get();
+                let mut last_forced_tick = std::time::Instant::now();
+                let mut idle_vsyncs = 0u32;
                 loop {
+                    if idle_vsyncs >= IDLE_VSYNCS_BEFORE_PARK
+                        && let Some(wake) = wake
+                    {
+                        let remaining =
+                            VSYNC_SAFETY_TICK.saturating_sub(last_forced_tick.elapsed());
+                        wake.wait(remaining);
+                        idle_vsyncs = 0;
+                    }
                     vsync_provider.wait_for_vsync();
                     if check_device_lost(&directx_device.device)
                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
@@ -416,14 +511,33 @@ impl WindowsPlatform {
                             panic!("Device lost: {err}");
                         }
                     }
-                    let Some(all_windows) = all_windows.upgrade() else {
+                    if all_windows.upgrade().is_none() {
+                        break;
+                    }
+                    let Some(frame_requests) = frame_requests.upgrade() else {
                         break;
                     };
-                    for hwnd in all_windows.read().iter() {
-                        unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                    // Invalidate only windows that asked for a frame since the
+                    // last vsync. An idle window used to be redrawn at the
+                    // display rate (240 Hz: 14 400 `draw_window` calls a minute
+                    // for a handful of real frames). The periodic pass is a
+                    // safety net for a request the flag could miss; it costs
+                    // one cheap frame request per window per second.
+                    let force_all = last_forced_tick.elapsed() >= VSYNC_SAFETY_TICK;
+                    if force_all {
+                        last_forced_tick = std::time::Instant::now();
+                    }
+                    let mut requested = force_all;
+                    for (hwnd, requester) in frame_requests.read().iter() {
+                        if requester.take() || force_all {
+                            requested = true;
+                            unsafe {
+                                let _ =
+                                    RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                            }
                         }
                     }
+                    idle_vsyncs = if requested { 0 } else { idle_vsyncs + 1 };
                 }
             })
             .unwrap();
@@ -620,6 +734,9 @@ impl Platform for WindowsPlatform {
         let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle.into());
+        self.frame_requests
+            .write()
+            .push((handle.into(), window.0.state.frame_requester.clone()));
 
         Ok(Box::new(window))
     }
@@ -1012,6 +1129,7 @@ impl WindowsPlatformInner {
         Ok(Rc::new(Self {
             state,
             raw_window_handles: context.raw_window_handles.clone(),
+            frame_requests: context.frame_requests.clone(),
             dispatcher: context
                 .dispatcher
                 .as_ref()
@@ -1095,6 +1213,11 @@ impl WindowsPlatformInner {
             log::error!("Failed to upgrade raw window handles");
             return false;
         };
+        if let Some(frame_requests) = self.frame_requests.upgrade() {
+            frame_requests
+                .write()
+                .retain(|(handle, _)| handle.as_raw() != target_window);
+        }
         let mut lock = all_windows.write();
         let index = lock
             .iter()
@@ -1108,25 +1231,38 @@ impl WindowsPlatformInner {
     #[inline]
     fn run_foreground_task(&self) -> Option<isize> {
         const MAIN_TASK_TIMEOUT: u128 = 10;
+        // Posted messages (including our own task wake-ups) are served before
+        // WM_PAINT, so a steady stream of short tasks that never reaches the
+        // 10 ms budget starves painting entirely. Give a pending paint a turn
+        // at roughly one display frame of continuous task work instead.
+        const PAINT_SERVICE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 
         let start = std::time::Instant::now();
+        let mut last_paint_service = start;
+        let process_message = |msg: &_| {
+            if translate_accelerator(msg).is_none() {
+                _ = unsafe { TranslateMessage(msg) };
+                unsafe { DispatchMessageW(msg) };
+            }
+        };
+        let peek_msg = |msg: &mut _, msg_kind| unsafe {
+            PeekMessageW(msg, None, 0, 0, PM_REMOVE | msg_kind).as_bool()
+        };
         'tasks: loop {
             'timeout_loop: loop {
+                if last_paint_service.elapsed() >= PAINT_SERVICE_INTERVAL {
+                    last_paint_service = std::time::Instant::now();
+                    let mut msg = MSG::default();
+                    if peek_msg(&mut msg, PM_QS_PAINT) {
+                        process_message(&msg);
+                    }
+                }
                 if start.elapsed().as_millis() >= MAIN_TASK_TIMEOUT {
                     log::debug!("foreground task timeout reached");
                     // we spent our budget on gpui tasks, we likely have a lot of work queued so drain system events first to stay responsive
                     // then quit out of foreground work to allow us to process other gpui events first before returning back to foreground task work
                     // if we don't we might not for example process window quit events
                     let mut msg = MSG::default();
-                    let process_message = |msg: &_| {
-                        if translate_accelerator(msg).is_none() {
-                            _ = unsafe { TranslateMessage(msg) };
-                            unsafe { DispatchMessageW(msg) };
-                        }
-                    };
-                    let peek_msg = |msg: &mut _, msg_kind| unsafe {
-                        PeekMessageW(msg, None, 0, 0, PM_REMOVE | msg_kind).as_bool()
-                    };
                     // We need to process a paint message here as otherwise we will re-enter `run_foreground_task` before painting if we have work remaining.
                     // The reason for this is that windows prefers custom application message processing over system messages.
                     if peek_msg(&mut msg, PM_QS_PAINT) {
@@ -1252,6 +1388,7 @@ pub(crate) struct WindowCreationInfo {
 struct PlatformWindowCreateContext {
     inner: Option<Result<Rc<WindowsPlatformInner>>>,
     raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    frame_requests: std::sync::Weak<RwLock<SmallVec<[FrameRequestEntry; 4]>>>,
     validation_number: usize,
     main_sender: Option<PriorityQueueSender<RunnableVariant>>,
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,

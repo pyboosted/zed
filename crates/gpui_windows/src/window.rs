@@ -73,6 +73,11 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    /// Asked by gpui (through `PlatformWindow::frame_requester`) and by the
+    /// window procedure whenever this window wants a frame; the vsync thread
+    /// invalidates only windows that asked (plus a slow safety tick) and
+    /// parks while none did.
+    pub(crate) frame_requester: Arc<WindowsFrameRequester>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -201,6 +206,7 @@ impl WindowsWindowState {
             ignores_mouse_events: Cell::new(false),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            frame_requester: Arc::new(WindowsFrameRequester::new()),
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -1007,6 +1013,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.state.callbacks.request_frame.set(Some(callback));
+    }
+
+    fn frame_requester(&self) -> Option<Arc<dyn PlatformFrameRequester>> {
+        Some(self.state.frame_requester.clone())
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {

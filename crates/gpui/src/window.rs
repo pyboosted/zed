@@ -11,7 +11,7 @@ use crate::{
     KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
     Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    PlatformFrameRequester, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
     SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
@@ -134,6 +134,9 @@ struct FrameDirtyAccumulator {
 #[derive(Clone)]
 pub(crate) struct WindowInvalidator {
     inner: Rc<RefCell<WindowInvalidatorInner>>,
+    /// The platform's frame requester (see `PlatformWindow::frame_requester`),
+    /// asked for a frame whenever this window wants one.
+    frame_requester: Option<Arc<dyn PlatformFrameRequester>>,
 }
 
 impl WindowInvalidator {
@@ -146,6 +149,21 @@ impl WindowInvalidator {
                 update_count: 0,
                 frame_dirty: FrameDirtyAccumulator::default(),
             })),
+            frame_requester: None,
+        }
+    }
+
+    /// Attaches the platform's frame requester and asks for the first frame.
+    pub(crate) fn attach_frame_requester(&mut self, requester: Arc<dyn PlatformFrameRequester>) {
+        requester.request_frame();
+        self.frame_requester = Some(requester);
+    }
+
+    /// Asks the platform for a frame without marking anything dirty (next-frame
+    /// callbacks, retained motion cadence, a throttled request to retry).
+    pub(crate) fn request_frame(&self) {
+        if let Some(requester) = &self.frame_requester {
+            requester.request_frame();
         }
     }
 
@@ -159,6 +177,7 @@ impl WindowInvalidator {
         Self::record_frame_dirty(&mut inner);
         inner.dirty = true;
         drop(inner);
+        self.request_frame();
         cx.push_effect(Effect::Notify { emitter: entity });
         true
     }
@@ -173,6 +192,8 @@ impl WindowInvalidator {
         if dirty {
             inner.update_count += 1;
             Self::record_frame_dirty(&mut inner);
+            drop(inner);
+            self.request_frame();
         }
     }
 
@@ -1308,6 +1329,10 @@ impl MotionPresentationState {
         }
     }
 
+    fn schedule_active(&self, now: Instant) -> bool {
+        self.schedule.active_frame_interval(now).is_some()
+    }
+
     fn presentation_due(&mut self, now: Instant) -> bool {
         let Some(interval) = self.schedule.active_frame_interval(now) else {
             self.next_deadline = None;
@@ -1578,7 +1603,10 @@ impl Window {
         let scale_factor = platform_window.scale_factor();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
-        let invalidator = WindowInvalidator::new();
+        let mut invalidator = WindowInvalidator::new();
+        if let Some(requester) = platform_window.frame_requester() {
+            invalidator.attach_frame_requester(requester);
+        }
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
@@ -1751,6 +1779,9 @@ impl Window {
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
+                        // The platform only requests frames while the flag is
+                        // raised; a throttled request must be retried.
+                        invalidator.request_frame();
                         // Must still complete the frame on platforms that require it.
                         // On Wayland, `surface.frame()` was already called to request the
                         // next frame callback, so we must call `surface.commit()` (via
@@ -1826,6 +1857,22 @@ impl Window {
                         window.complete_frame();
                     })
                     .log_err();
+
+                // Re-arm the platform's frame request while anything still
+                // wants frames: a window dirtied during this draw, pending
+                // next-frame callbacks, an active retained-motion cadence, or
+                // sustained high-rate input. Otherwise the vsync loop goes
+                // quiet until the next invalidation.
+                let motion_active = motion_presentation
+                    .borrow()
+                    .schedule_active(Instant::now());
+                if invalidator.is_dirty()
+                    || !next_frame_callbacks.borrow().is_empty()
+                    || motion_active
+                    || high_rate_input
+                {
+                    invalidator.request_frame();
+                }
             }
         }));
         platform_window.on_resize(Box::new({
@@ -2797,6 +2844,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.invalidator.request_frame();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -3411,6 +3459,7 @@ impl Window {
             self.refresh();
         }
         self.needs_present.set(true);
+        self.invalidator.request_frame();
 
         if let Some(draw_start) = draw_started_at {
             profiler::record_frame_timing(profiler::FrameTiming {

@@ -794,6 +794,13 @@ pub enum TextInputStateChange {
 }
 
 #[expect(missing_docs)]
+/// Cross-thread handle through which a window asks its platform for a frame.
+/// See [`PlatformWindow::frame_requester`].
+pub trait PlatformFrameRequester: Send + Sync {
+    /// Ask for a frame on the next vsync.
+    fn request_frame(&self);
+}
+
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn native_window_id(&self) -> Option<u64> {
@@ -832,6 +839,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
+    /// The window calls `request_frame` on this whenever it wants a frame
+    /// (invalidation, next-frame callbacks, retained motion, throttled
+    /// requests). Platforms whose frame loop otherwise runs unconditionally on
+    /// every vsync (Windows) use it to invalidate only windows that asked and
+    /// to park the vsync thread while nothing did, so an idle window is not
+    /// redrawn at the display rate. `None` keeps the platform's own frame
+    /// loop unchanged.
+    fn frame_requester(&self) -> Option<Arc<dyn PlatformFrameRequester>> {
+        None
+    }
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
