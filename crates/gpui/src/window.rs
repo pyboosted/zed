@@ -4657,7 +4657,7 @@ impl Window {
             .map(|island| island.ancestor.scale(self.scale_factor()));
         self.next_frame
             .scene
-            .insert_primitive_clipped(primitive.into(), clip.as_ref());
+            .insert_primitive_clipped(primitive.into(), clip.as_ref(), None);
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.

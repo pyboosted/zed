@@ -135,6 +135,24 @@ where
         ordering
     }
 
+    /// Inserts one leaf standing for a block of `span + 1` consecutive
+    /// orders (a replayed range of primitives, see `Scene::replay_translated`):
+    /// the block starts above everything it intersects and the leaf carries
+    /// the block's last order, so later intersecting bounds land above the
+    /// whole block. Returns the block's first order.
+    pub fn insert_block(&mut self, bounds: Bounds<U>, span: u32) -> u32 {
+        let max_intersecting = self.find_max_ordering(&bounds);
+        let first = max_intersecting + 1;
+        let last = first.saturating_add(span);
+        let new_leaf_idx = self.insert_leaf(bounds, last);
+        self.max_leaf = match self.max_leaf {
+            None => Some(new_leaf_idx),
+            Some(old_idx) if self.nodes[old_idx].max_order < last => Some(new_leaf_idx),
+            some => some,
+        };
+        first
+    }
+
     /// Finds the maximum ordering among all bounds that intersect with the query.
     fn find_max_ordering(&mut self, query: &Bounds<U>) -> u32 {
         let Some(root_idx) = self.root else {
