@@ -2390,42 +2390,6 @@ impl ContentMask<ScaledPixels> {
         }
         mask
     }
-
-    /// Intersect the content mask with the given content mask.
-    pub(crate) fn intersect(&self, other: &Self) -> Self {
-        let mut mask = ContentMask::from_bounds(self.bounds.intersect(&other.bounds));
-        let total_clips = self.rounded_clip_count as usize + other.rounded_clip_count as usize;
-        debug_assert!(
-            total_clips <= CONTENT_MASK_ROUNDED_CLIP_CAPACITY,
-            "content mask rounded clip capacity exceeded"
-        );
-
-        for clip in self
-            .rounded_clips
-            .iter()
-            .take(self.rounded_clip_count as usize)
-            .chain(
-                other
-                    .rounded_clips
-                    .iter()
-                    .take(other.rounded_clip_count as usize),
-            )
-        {
-            mask.push_rounded_clip(clip.bounds, clip.corner_radii);
-        }
-
-        mask
-    }
-
-    /// A mask that clips nothing: the replay-log mask of a primitive painted
-    /// in a cached view that pushed no mask of its own.
-    pub(crate) fn unbounded() -> Self {
-        const EXTENT: f32 = 1.0e7;
-        ContentMask::from_bounds(Bounds {
-            origin: Point::new(ScaledPixels(-EXTENT), ScaledPixels(-EXTENT)),
-            size: Size::new(ScaledPixels(2.0 * EXTENT), ScaledPixels(2.0 * EXTENT)),
-        })
-    }
 }
 
 impl ContentMask<Pixels> {
@@ -4613,6 +4577,33 @@ impl Window {
         })
     }
 
+    /// How many quads and glyph/image sprites the last drawn frame put on
+    /// screen (diagnostics: a replayed frame should carry as many as a fresh
+    /// one of the same content).
+    pub fn drawn_primitive_counts(&self) -> (usize, usize, usize) {
+        let scene = &self.rendered_frame.scene;
+        let dead = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+            bounds.intersect(&mask.bounds).is_empty()
+        };
+        let dead_sprites = scene
+            .monochrome_sprites
+            .iter()
+            .filter(|sprite| dead(&sprite.bounds, &sprite.content_mask))
+            .count()
+            + scene
+                .subpixel_sprites
+                .iter()
+                .filter(|sprite| dead(&sprite.bounds, &sprite.content_mask))
+                .count();
+        (
+            scene.quads.len(),
+            scene.monochrome_sprites.len()
+                + scene.subpixel_sprites.len()
+                + scene.polychrome_sprites.len(),
+            dead_sprites,
+        )
+    }
+
     /// The content mask with every ancestor applied, also inside a replay
     /// island (where `content_mask` is view-local).
     pub(crate) fn effective_content_mask(&self) -> ContentMask<Pixels> {
@@ -4883,9 +4874,13 @@ impl Window {
         let content_mask = self.content_mask();
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
-            self.next_frame
-                .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
+            let visible = clipped_bounds.intersect(&self.effective_content_mask().bounds);
+            let layer_bounds = self.cover_bounds(clipped_bounds);
+            if visible.is_empty() {
+                self.next_frame.scene.push_layer_hidden(layer_bounds);
+            } else {
+                self.next_frame.scene.push_layer(layer_bounds);
+            }
         }
 
         let result = f(self);

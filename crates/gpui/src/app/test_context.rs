@@ -1,4 +1,4 @@
-use crate::{
+use crate::{ScaledPixels, 
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
     BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
     Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
@@ -887,6 +887,40 @@ impl VisualTestContext {
     /// debug_bounds returns the bounds of the element with the given selector.
     pub fn debug_bounds(&mut self, selector: &'static str) -> Option<Bounds<Pixels>> {
         self.update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
+    }
+
+    /// The number of quads and of glyph/image sprites the last drawn frame
+    /// put inside `bounds` (window pixels): what a region actually shows,
+    /// replayed or fresh.
+    pub fn drawn_primitives_within(&mut self, bounds: Bounds<Pixels>) -> (usize, usize) {
+        self.update(|window, _| {
+            let bounds = bounds.scale(window.scale_factor());
+            let scene = &window.rendered_frame.scene;
+            let inside = |primitive: &Bounds<ScaledPixels>, mask: &Bounds<ScaledPixels>| {
+                !primitive.intersect(mask).intersect(&bounds).is_empty()
+            };
+            let quads = scene
+                .quads
+                .iter()
+                .filter(|quad| inside(&quad.bounds, &quad.content_mask.bounds))
+                .count();
+            let sprites = scene
+                .monochrome_sprites
+                .iter()
+                .filter(|sprite| inside(&sprite.bounds, &sprite.content_mask.bounds))
+                .count()
+                + scene
+                    .subpixel_sprites
+                    .iter()
+                    .filter(|sprite| inside(&sprite.bounds, &sprite.content_mask.bounds))
+                    .count()
+                + scene
+                    .polychrome_sprites
+                    .iter()
+                    .filter(|sprite| inside(&sprite.bounds, &sprite.content_mask.bounds))
+                    .count();
+            (quads, sprites)
+        })
     }
 
     /// Draw an element to the window. Useful for simulating events or actions

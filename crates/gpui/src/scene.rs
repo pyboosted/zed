@@ -42,6 +42,15 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    /// The primitives in insertion order, drawn or not, with the masks they
+    /// were painted with (view-local inside a cached view); the replay log
+    /// (`paint_operations`) refers to them by kind and range.
+    logged: LoggedPrimitives,
+    /// Set by [`Scene::len`] (a replay-range boundary) so the next primitive
+    /// starts a new run instead of joining the previous one: a range must
+    /// begin and end on an operation boundary, or a nested cached view's
+    /// range would shift when the log is replayed.
+    sealed: std::cell::Cell<bool>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     /// The order given to the last inserted primitive or layer; a primitive
@@ -220,6 +229,7 @@ fn sort_unstable_if_needed<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K) {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.logged.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.last_order = 0;
@@ -236,11 +246,22 @@ impl Scene {
     }
 
     pub fn len(&self) -> usize {
+        self.sealed.set(true);
         self.paint_operations.len()
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
+        self.push_layer_with_order(bounds, order);
+    }
+
+    /// A layer whose bounds are fully clipped (nothing in it draws now, it
+    /// is logged for replay): it takes the next order above the last one,
+    /// as hidden primitives do, instead of asking the bounds tree, where its
+    /// off-screen bounds intersect nothing and would rank it under content
+    /// painted before it.
+    pub fn push_layer_hidden(&mut self, bounds: Bounds<ScaledPixels>) {
+        let order = self.last_order.saturating_add(1);
         self.push_layer_with_order(bounds, order);
     }
 
@@ -277,91 +298,76 @@ impl Scene {
         order: Option<DrawOrder>,
     ) {
         let effective = clip.map(|clip| clip.intersect_unique(primitive.content_mask()));
-        self.insert_primitive_masked(primitive, effective, order);
+        match primitive {
+            Primitive::Shadow(shadow) => self.log_and_draw(shadow, effective, order),
+            Primitive::Quad(quad) => self.log_and_draw(quad, effective, order),
+            Primitive::Effect(effect) => self.log_and_draw(effect, effective, order),
+            Primitive::Path(path) => self.log_and_draw(path, effective, order),
+            Primitive::Underline(underline) => self.log_and_draw(underline, effective, order),
+            Primitive::MonochromeSprite(sprite) => self.log_and_draw(sprite, effective, order),
+            Primitive::SubpixelSprite(sprite) => self.log_and_draw(sprite, effective, order),
+            Primitive::PolychromeSprite(sprite) => self.log_and_draw(sprite, effective, order),
+            Primitive::Surface(surface) => self.log_and_draw(surface, effective, order),
+        }
     }
 
-    /// [`Scene::insert_primitive_clipped`] with the drawn copy's mask already
-    /// computed (`effective`; `None` keeps the primitive's own mask and does
-    /// not log a fully clipped primitive).
-    fn insert_primitive_masked(
+    /// Records `primitive` (painted with its own, possibly view-local, mask)
+    /// in the log and draws it with `effective` (`None`: its own mask, and a
+    /// fully clipped primitive is dropped altogether, as outside a cached
+    /// view nothing replays it).
+    fn log_and_draw<T: LoggedPrimitive>(
         &mut self,
-        mut primitive: Primitive,
+        mut primitive: T,
         effective: Option<ContentMask<ScaledPixels>>,
         order: Option<DrawOrder>,
     ) {
-        let clip = effective.is_some();
         let logged_mask = *primitive.content_mask();
-        if let Some(effective) = effective {
-            primitive.set_content_mask(effective);
-        }
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
-
-        if clipped_bounds.is_empty() {
-            if clip {
-                primitive.set_content_mask(logged_mask);
-                primitive.set_order(order.unwrap_or(self.last_order));
-                self.paint_operations
-                    .push(PaintOperation::Primitive(primitive));
-            }
+        let drawn_mask = effective.unwrap_or(logged_mask);
+        let clipped_bounds = primitive.bounds().intersect(&drawn_mask.bounds);
+        let drawn = !clipped_bounds.is_empty();
+        if !drawn && effective.is_none() {
             return;
         }
-
-        let order = order.unwrap_or_else(|| {
-            self.layer_stack
+        let order = match order {
+            Some(order) => order,
+            None if drawn => self
+                .layer_stack
                 .last()
                 .copied()
-                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
-        });
+                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds)),
+            // Fully clipped: no tree order. Paint order must still hold once
+            // a replay reveals it, and equal orders would let the batch
+            // iterator put a glyph under the background quad painted before
+            // it, so every hidden primitive goes one above the last one.
+            None => self.last_order.saturating_add(1),
+        };
         self.last_order = order;
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
-                shadow.order = order;
-                self.shadows.push(*shadow);
-            }
-            Primitive::Quad(quad) => {
-                quad.order = order;
-                self.quads.push(*quad);
-            }
-            Primitive::Effect(effect) => {
-                effect.instance.order = order;
-                self.effects.push(effect.instance);
-                if let Some(animation) = effect.animation {
-                    self.motion_schedule.register(animation);
-                }
-            }
-            Primitive::Path(path) => {
-                path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
-            }
-            Primitive::Underline(underline) => {
-                underline.order = order;
-                self.underlines.push(*underline);
-            }
-            Primitive::MonochromeSprite(sprite) => {
-                sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
-            }
-            Primitive::PolychromeSprite(sprite) => {
-                sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
-            }
-            Primitive::Surface(surface) => {
-                surface.order = order;
-                self.surfaces.push(surface.clone());
-            }
+        primitive.set_order(order);
+        if drawn {
+            let mut copy = primitive.clone();
+            copy.set_content_mask(drawn_mask);
+            T::draw(self, copy);
         }
-        if clip {
-            primitive.set_content_mask(logged_mask);
+        let list = T::logged_mut(&mut self.logged);
+        let index = list.len() as u32;
+        list.push(primitive);
+        let sealed = self.sealed.replace(false);
+        match self.paint_operations.last_mut() {
+            Some(PaintOperation::Run {
+                kind,
+                start,
+                len,
+                mask,
+            }) if !sealed && *kind == T::KIND && *start + *len == index && *mask == logged_mask => {
+                *len += 1;
+            }
+            _ => self.paint_operations.push(PaintOperation::Run {
+                kind: T::KIND,
+                start: index,
+                len: 1,
+                mask: logged_mask,
+            }),
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
     }
 
     /// Re-inserts the logged range. `clip` is the effective content mask at
@@ -387,7 +393,9 @@ impl Scene {
     /// first order, and every primitive and layer is offset from it (before,
     /// each replayed primitive queried the tree on its own, ~a quarter of a
     /// pan frame in Enjoy). Later primitives that intersect the block land
-    /// above all of it.
+    /// above all of it. The log is read per run of one kind and mask, so the
+    /// mask work happens once per run and each primitive is copied as its
+    /// own small struct.
     pub(crate) fn replay_translated(
         &mut self,
         range: Range<usize>,
@@ -395,31 +403,38 @@ impl Scene {
         offset: Point<ScaledPixels>,
         clip: &ContentMask<ScaledPixels>,
     ) {
-        let translated = offset != Point::default();
         let operations = &prev_scene.paint_operations[range];
 
         let mut first_order = DrawOrder::MAX;
         let mut last_order = DrawOrder::MIN;
         let mut drawn_union: Option<Bounds<ScaledPixels>> = None;
         for operation in operations {
-            let (order, bounds) = match operation {
-                PaintOperation::Primitive(primitive) => {
-                    let mask_bounds = primitive.content_mask().bounds + offset;
-                    let drawn = (*primitive.bounds() + offset)
-                        .intersect(&mask_bounds)
-                        .intersect(&clip.bounds);
-                    (primitive.order(), (!drawn.is_empty()).then_some(drawn))
+            match operation {
+                PaintOperation::Run {
+                    kind,
+                    start,
+                    len,
+                    mask,
+                } => {
+                    let visible = (mask.bounds + offset).intersect(&clip.bounds);
+                    let range = *start as usize..(*start + *len) as usize;
+                    prev_scene.logged.scan(*kind, range, |order, bounds| {
+                        first_order = first_order.min(order);
+                        last_order = last_order.max(order);
+                        let drawn = (bounds + offset).intersect(&visible);
+                        if !drawn.is_empty() {
+                            drawn_union = Some(match drawn_union {
+                                Some(union) => union.union(&drawn),
+                                None => drawn,
+                            });
+                        }
+                    });
                 }
-                PaintOperation::StartLayer(_, order) => (*order, None),
-                PaintOperation::EndLayer => continue,
-            };
-            first_order = first_order.min(order);
-            last_order = last_order.max(order);
-            if let Some(bounds) = bounds {
-                drawn_union = Some(match drawn_union {
-                    Some(union) => union.union(&bounds),
-                    None => bounds,
-                });
+                PaintOperation::StartLayer(_, order) => {
+                    first_order = first_order.min(*order);
+                    last_order = last_order.max(*order);
+                }
+                PaintOperation::EndLayer => {}
             }
         }
         if first_order == DrawOrder::MAX {
@@ -429,38 +444,84 @@ impl Scene {
             Some(union) => self
                 .primitive_bounds
                 .insert_block(union, last_order - first_order),
-            None => self.last_order,
+            // Nothing of the range draws here (a view still fully outside):
+            // it keeps its relative orders above the last one, like a hidden
+            // primitive, so a later replay that reveals it stays in order.
+            None => self.last_order.saturating_add(1),
         };
 
-        // Neighbouring primitives of a range mostly share one logged mask
-        // (a pane's clip): intersect it with `clip` once per run.
-        let mut memo: Option<(ContentMask<ScaledPixels>, ContentMask<ScaledPixels>)> = None;
         for operation in operations {
+            // One logged operation becomes exactly one operation again, so
+            // the ranges recorded inside this one keep their offsets.
+            self.sealed.set(true);
             match operation {
-                PaintOperation::Primitive(primitive) => {
-                    let mut primitive = primitive.clone();
-                    if translated {
-                        primitive.translate(offset);
-                    }
-                    let logged_mask = *primitive.content_mask();
-                    let effective = match &memo {
-                        Some((last_logged, last_effective)) if *last_logged == logged_mask => {
-                            *last_effective
-                        }
-                        _ => {
-                            let effective = clip.intersect_unique(&logged_mask);
-                            memo = Some((logged_mask, effective));
-                            effective
-                        }
-                    };
-                    let order = base + (primitive.order() - first_order);
-                    self.insert_primitive_masked(primitive, Some(effective), Some(order));
+                PaintOperation::Run {
+                    kind,
+                    start,
+                    len,
+                    mask,
+                } => {
+                    let logged_mask = mask.translated(offset);
+                    let effective = clip.intersect_unique(&logged_mask);
+                    let range = *start as usize..(*start + *len) as usize;
+                    self.replay_run(
+                        &prev_scene.logged,
+                        *kind,
+                        range,
+                        offset,
+                        logged_mask,
+                        effective,
+                        base,
+                        first_order,
+                    );
                 }
                 PaintOperation::StartLayer(bounds, order) => {
                     self.push_layer_with_order(*bounds + offset, base + (order - first_order));
                 }
                 PaintOperation::EndLayer => self.pop_layer(),
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_run(
+        &mut self,
+        logged: &LoggedPrimitives,
+        kind: LoggedKind,
+        range: Range<usize>,
+        offset: Point<ScaledPixels>,
+        logged_mask: ContentMask<ScaledPixels>,
+        effective: ContentMask<ScaledPixels>,
+        base: DrawOrder,
+        first_order: DrawOrder,
+    ) {
+        fn replay<T: LoggedPrimitive>(
+            scene: &mut Scene,
+            list: &[T],
+            offset: Point<ScaledPixels>,
+            logged_mask: ContentMask<ScaledPixels>,
+            effective: ContentMask<ScaledPixels>,
+            base: DrawOrder,
+            first_order: DrawOrder,
+        ) {
+            for primitive in list {
+                let mut primitive = primitive.clone();
+                primitive.translate(offset);
+                primitive.set_content_mask(logged_mask);
+                let order = base + (primitive.order() - first_order);
+                scene.log_and_draw(primitive, Some(effective), Some(order));
+            }
+        }
+        match kind {
+            LoggedKind::Shadow => replay(self, &logged.shadows[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::Quad => replay(self, &logged.quads[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::Effect => replay(self, &logged.effects[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::Path => replay(self, &logged.paths[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::Underline => replay(self, &logged.underlines[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::MonochromeSprite => replay(self, &logged.monochrome_sprites[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::SubpixelSprite => replay(self, &logged.subpixel_sprites[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::PolychromeSprite => replay(self, &logged.polychrome_sprites[range], offset, logged_mask, effective, base, first_order),
+            LoggedKind::Surface => replay(self, &logged.surfaces[range], offset, logged_mask, effective, base, first_order),
         }
     }
 
@@ -616,10 +677,248 @@ pub(crate) enum PrimitiveKind {
 }
 
 pub(crate) enum PaintOperation {
-    Primitive(Primitive),
+    /// `len` consecutive primitives of `kind` in the insertion-order log
+    /// (`Scene::logged`), all painted with `mask` (the view-local mask inside
+    /// a cached view).
+    Run {
+        kind: LoggedKind,
+        start: u32,
+        len: u32,
+        mask: ContentMask<ScaledPixels>,
+    },
     StartLayer(Bounds<ScaledPixels>, DrawOrder),
     EndLayer,
 }
+
+/// The kind of a logged primitive; selects the list in [`LoggedPrimitives`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoggedKind {
+    Shadow,
+    Quad,
+    Effect,
+    Path,
+    Underline,
+    MonochromeSprite,
+    SubpixelSprite,
+    PolychromeSprite,
+    Surface,
+}
+
+/// The insertion-order copies of every primitive, drawn or fully clipped,
+/// each with the mask it was painted with; see [`PaintOperation::Run`].
+#[derive(Default)]
+pub(crate) struct LoggedPrimitives {
+    shadows: Vec<Shadow>,
+    quads: Vec<Quad>,
+    effects: Vec<EffectPrimitive>,
+    paths: Vec<Path<ScaledPixels>>,
+    underlines: Vec<Underline>,
+    monochrome_sprites: Vec<MonochromeSprite>,
+    subpixel_sprites: Vec<SubpixelSprite>,
+    polychrome_sprites: Vec<PolychromeSprite>,
+    surfaces: Vec<PaintSurface>,
+}
+
+impl LoggedPrimitives {
+    fn clear(&mut self) {
+        self.shadows.clear();
+        self.quads.clear();
+        self.effects.clear();
+        self.paths.clear();
+        self.underlines.clear();
+        self.monochrome_sprites.clear();
+        self.subpixel_sprites.clear();
+        self.polychrome_sprites.clear();
+        self.surfaces.clear();
+    }
+
+    /// Calls `f(order, bounds)` for every logged primitive of `kind` in
+    /// `range`.
+    fn scan(
+        &self,
+        kind: LoggedKind,
+        range: Range<usize>,
+        mut f: impl FnMut(DrawOrder, Bounds<ScaledPixels>),
+    ) {
+        fn each<T: LoggedPrimitive>(list: &[T], f: &mut impl FnMut(DrawOrder, Bounds<ScaledPixels>)) {
+            for primitive in list {
+                f(primitive.order(), primitive.bounds());
+            }
+        }
+        match kind {
+            LoggedKind::Shadow => each(&self.shadows[range], &mut f),
+            LoggedKind::Quad => each(&self.quads[range], &mut f),
+            LoggedKind::Effect => each(&self.effects[range], &mut f),
+            LoggedKind::Path => each(&self.paths[range], &mut f),
+            LoggedKind::Underline => each(&self.underlines[range], &mut f),
+            LoggedKind::MonochromeSprite => each(&self.monochrome_sprites[range], &mut f),
+            LoggedKind::SubpixelSprite => each(&self.subpixel_sprites[range], &mut f),
+            LoggedKind::PolychromeSprite => each(&self.polychrome_sprites[range], &mut f),
+            LoggedKind::Surface => each(&self.surfaces[range], &mut f),
+        }
+    }
+}
+
+/// A primitive as the replay log stores it: its draw order, bounds and mask
+/// are readable and movable, and it knows its log list and draw list.
+pub(crate) trait LoggedPrimitive: Clone {
+    const KIND: LoggedKind;
+    fn order(&self) -> DrawOrder;
+    fn set_order(&mut self, order: DrawOrder);
+    fn bounds(&self) -> Bounds<ScaledPixels>;
+    fn content_mask(&self) -> &ContentMask<ScaledPixels>;
+    fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>);
+    /// Moves the geometry by `offset` (the mask is set separately).
+    fn translate(&mut self, offset: Point<ScaledPixels>);
+    fn logged_mut(logged: &mut LoggedPrimitives) -> &mut Vec<Self>;
+    /// Pushes the drawn copy into the scene's draw list.
+    fn draw(scene: &mut Scene, primitive: Self);
+}
+
+macro_rules! logged_primitive {
+    ($type:ty, $kind:ident, $list:ident, |$scene:ident, $primitive:ident| $draw:block) => {
+        impl LoggedPrimitive for $type {
+            const KIND: LoggedKind = LoggedKind::$kind;
+            fn order(&self) -> DrawOrder {
+                self.order
+            }
+            fn set_order(&mut self, order: DrawOrder) {
+                self.order = order;
+            }
+            fn bounds(&self) -> Bounds<ScaledPixels> {
+                self.bounds
+            }
+            fn content_mask(&self) -> &ContentMask<ScaledPixels> {
+                &self.content_mask
+            }
+            fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
+                self.content_mask = mask;
+            }
+            fn translate(&mut self, offset: Point<ScaledPixels>) {
+                self.bounds = self.bounds + offset;
+            }
+            fn logged_mut(logged: &mut LoggedPrimitives) -> &mut Vec<Self> {
+                &mut logged.$list
+            }
+            fn draw($scene: &mut Scene, $primitive: Self) $draw
+        }
+    };
+}
+
+logged_primitive!(Quad, Quad, quads, |scene, quad| { scene.quads.push(quad) });
+logged_primitive!(Underline, Underline, underlines, |scene, underline| {
+    scene.underlines.push(underline)
+});
+logged_primitive!(MonochromeSprite, MonochromeSprite, monochrome_sprites, |scene, sprite| {
+    scene.monochrome_sprites.push(sprite)
+});
+logged_primitive!(SubpixelSprite, SubpixelSprite, subpixel_sprites, |scene, sprite| {
+    scene.subpixel_sprites.push(sprite)
+});
+logged_primitive!(PolychromeSprite, PolychromeSprite, polychrome_sprites, |scene, sprite| {
+    scene.polychrome_sprites.push(sprite)
+});
+logged_primitive!(PaintSurface, Surface, surfaces, |scene, surface| {
+    scene.surfaces.push(surface)
+});
+
+impl LoggedPrimitive for Shadow {
+    const KIND: LoggedKind = LoggedKind::Shadow;
+    fn order(&self) -> DrawOrder {
+        self.order
+    }
+    fn set_order(&mut self, order: DrawOrder) {
+        self.order = order;
+    }
+    fn bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds
+    }
+    fn content_mask(&self) -> &ContentMask<ScaledPixels> {
+        &self.content_mask
+    }
+    fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
+        self.content_mask = mask;
+    }
+    fn translate(&mut self, offset: Point<ScaledPixels>) {
+        self.bounds = self.bounds + offset;
+        self.element_bounds = self.element_bounds + offset;
+    }
+    fn logged_mut(logged: &mut LoggedPrimitives) -> &mut Vec<Self> {
+        &mut logged.shadows
+    }
+    fn draw(scene: &mut Scene, shadow: Self) {
+        scene.shadows.push(shadow);
+    }
+}
+
+impl LoggedPrimitive for EffectPrimitive {
+    const KIND: LoggedKind = LoggedKind::Effect;
+    fn order(&self) -> DrawOrder {
+        self.instance.order
+    }
+    fn set_order(&mut self, order: DrawOrder) {
+        self.instance.order = order;
+    }
+    fn bounds(&self) -> Bounds<ScaledPixels> {
+        self.instance.bounds
+    }
+    fn content_mask(&self) -> &ContentMask<ScaledPixels> {
+        &self.instance.content_mask
+    }
+    fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
+        self.instance.content_mask = mask;
+    }
+    fn translate(&mut self, offset: Point<ScaledPixels>) {
+        self.instance.bounds = self.instance.bounds + offset;
+    }
+    fn logged_mut(logged: &mut LoggedPrimitives) -> &mut Vec<Self> {
+        &mut logged.effects
+    }
+    fn draw(scene: &mut Scene, effect: Self) {
+        scene.effects.push(effect.instance);
+        if let Some(animation) = effect.animation {
+            scene.motion_schedule.register(animation);
+        }
+    }
+}
+
+impl LoggedPrimitive for Path<ScaledPixels> {
+    const KIND: LoggedKind = LoggedKind::Path;
+    fn order(&self) -> DrawOrder {
+        self.order
+    }
+    fn set_order(&mut self, order: DrawOrder) {
+        self.order = order;
+    }
+    fn bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds
+    }
+    fn content_mask(&self) -> &ContentMask<ScaledPixels> {
+        &self.content_mask
+    }
+    fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
+        self.content_mask = mask;
+        for vertex in &mut self.vertices {
+            vertex.content_mask = mask;
+        }
+    }
+    fn translate(&mut self, offset: Point<ScaledPixels>) {
+        self.bounds = self.bounds + offset;
+        self.start = self.start + offset;
+        self.current = self.current + offset;
+        for vertex in &mut self.vertices {
+            vertex.xy_position = vertex.xy_position + offset;
+        }
+    }
+    fn logged_mut(logged: &mut LoggedPrimitives) -> &mut Vec<Self> {
+        &mut logged.paths
+    }
+    fn draw(scene: &mut Scene, mut path: Self) {
+        path.id = PathId(scene.paths.len());
+        scene.paths.push(path);
+    }
+}
+
 
 #[derive(Clone)]
 #[expect(missing_docs)]
@@ -637,104 +936,6 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
-    /// Moves the primitive and its recorded content mask by `offset`; see
-    /// [`Scene::replay_translated`].
-    pub(crate) fn translate(&mut self, offset: Point<ScaledPixels>) {
-        match self {
-            Primitive::Shadow(shadow) => {
-                shadow.bounds = shadow.bounds + offset;
-                shadow.element_bounds = shadow.element_bounds + offset;
-                shadow.content_mask = shadow.content_mask.translated(offset);
-            }
-            Primitive::Quad(quad) => {
-                quad.bounds = quad.bounds + offset;
-                quad.content_mask = quad.content_mask.translated(offset);
-            }
-            Primitive::Effect(effect) => {
-                effect.instance.bounds = effect.instance.bounds + offset;
-                effect.instance.content_mask = effect.instance.content_mask.translated(offset);
-            }
-            Primitive::Path(path) => {
-                path.bounds = path.bounds + offset;
-                path.content_mask = path.content_mask.translated(offset);
-                path.start = path.start + offset;
-                path.current = path.current + offset;
-                for vertex in &mut path.vertices {
-                    vertex.xy_position = vertex.xy_position + offset;
-                    vertex.content_mask = vertex.content_mask.translated(offset);
-                }
-            }
-            Primitive::Underline(underline) => {
-                underline.bounds = underline.bounds + offset;
-                underline.content_mask = underline.content_mask.translated(offset);
-            }
-            Primitive::MonochromeSprite(sprite) => {
-                sprite.bounds = sprite.bounds + offset;
-                sprite.content_mask = sprite.content_mask.translated(offset);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                sprite.bounds = sprite.bounds + offset;
-                sprite.content_mask = sprite.content_mask.translated(offset);
-            }
-            Primitive::PolychromeSprite(sprite) => {
-                sprite.bounds = sprite.bounds + offset;
-                sprite.content_mask = sprite.content_mask.translated(offset);
-            }
-            Primitive::Surface(surface) => {
-                surface.bounds = surface.bounds + offset;
-                surface.content_mask = surface.content_mask.translated(offset);
-            }
-        }
-    }
-
-    pub(crate) fn order(&self) -> DrawOrder {
-        match self {
-            Primitive::Shadow(shadow) => shadow.order,
-            Primitive::Quad(quad) => quad.order,
-            Primitive::Effect(effect) => effect.instance.order,
-            Primitive::Path(path) => path.order,
-            Primitive::Underline(underline) => underline.order,
-            Primitive::MonochromeSprite(sprite) => sprite.order,
-            Primitive::SubpixelSprite(sprite) => sprite.order,
-            Primitive::PolychromeSprite(sprite) => sprite.order,
-            Primitive::Surface(surface) => surface.order,
-        }
-    }
-
-    pub(crate) fn set_order(&mut self, order: DrawOrder) {
-        match self {
-            Primitive::Shadow(shadow) => shadow.order = order,
-            Primitive::Quad(quad) => quad.order = order,
-            Primitive::Effect(effect) => effect.instance.order = order,
-            Primitive::Path(path) => path.order = order,
-            Primitive::Underline(underline) => underline.order = order,
-            Primitive::MonochromeSprite(sprite) => sprite.order = order,
-            Primitive::SubpixelSprite(sprite) => sprite.order = order,
-            Primitive::PolychromeSprite(sprite) => sprite.order = order,
-            Primitive::Surface(surface) => surface.order = order,
-        }
-    }
-
-    /// Replaces the content mask (a path's vertices carry copies of it).
-    pub(crate) fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
-        match self {
-            Primitive::Shadow(shadow) => shadow.content_mask = mask,
-            Primitive::Quad(quad) => quad.content_mask = mask,
-            Primitive::Effect(effect) => effect.instance.content_mask = mask,
-            Primitive::Path(path) => {
-                path.content_mask = mask;
-                for vertex in &mut path.vertices {
-                    vertex.content_mask = mask;
-                }
-            }
-            Primitive::Underline(underline) => underline.content_mask = mask,
-            Primitive::MonochromeSprite(sprite) => sprite.content_mask = mask,
-            Primitive::SubpixelSprite(sprite) => sprite.content_mask = mask,
-            Primitive::PolychromeSprite(sprite) => sprite.content_mask = mask,
-            Primitive::Surface(surface) => surface.content_mask = mask,
-        }
-    }
-
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -1501,6 +1702,176 @@ impl PathVertex<Pixels> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_range_replayed_while_fully_hidden_keeps_its_order_when_revealed() {
+        use crate::{ContentMask, ScaledPixels, point, size};
+        let rect = |x: f32, y: f32, w: f32, h: f32| crate::Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        };
+        let clip = ContentMask::from_bounds(rect(0.0, 0.0, 1000.0, 1000.0));
+        let pane_mask = ContentMask::from_bounds(rect(-400.0, 0.0, 400.0, 300.0));
+        let quad = |b: crate::Bounds<ScaledPixels>, mask: ContentMask<ScaledPixels>| super::Quad {
+            bounds: b,
+            content_mask: mask,
+            ..Default::default()
+        };
+        // A pane fully to the left of the viewport: background then content.
+        let mut recorded = super::Scene::default();
+        let start = recorded.len();
+        recorded.insert_primitive_clipped(
+            quad(rect(-400.0, 0.0, 400.0, 300.0), pane_mask).into(),
+            Some(&clip),
+            None,
+        );
+        recorded.insert_primitive_clipped(
+            quad(rect(-300.0, 50.0, 40.0, 20.0), pane_mask).into(),
+            Some(&clip),
+            None,
+        );
+        let end = recorded.len();
+        assert!(recorded.quads.is_empty(), "nothing draws while hidden");
+
+        // Replayed while still hidden, then revealed by a second replay.
+        let mut middle = super::Scene::default();
+        let middle_start = middle.len();
+        middle.replay_translated(
+            start..end,
+            &recorded,
+            point(ScaledPixels(-50.0), ScaledPixels(0.0)),
+            &clip,
+        );
+        let middle_end = middle.len();
+        assert!(middle.quads.is_empty(), "still hidden after the first move");
+
+        let mut revealed = super::Scene::default();
+        revealed.replay_translated(
+            middle_start..middle_end,
+            &middle,
+            point(ScaledPixels(500.0), ScaledPixels(0.0)),
+            &clip,
+        );
+        assert_eq!(revealed.quads.len(), 2, "both quads draw once revealed");
+        let background = revealed.quads[0];
+        let content = revealed.quads[1];
+        assert!(
+            content.order > background.order,
+            "the content stays above its pane background: {} vs {}",
+            content.order,
+            background.order
+        );
+    }
+
+    #[test]
+    fn replay_reveals_content_recorded_fully_hidden_above_its_background() {
+        use crate::{
+            AtlasTextureId, AtlasTextureKind, AtlasTile, ContentMask, Hsla, ScaledPixels, TileId,
+            TransformationMatrix, point, size,
+        };
+        let bounds = |x: f32, y: f32, w: f32, h: f32| crate::Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        };
+        // The viewport clip: x in [0, 1000).
+        let clip = ContentMask::from_bounds(bounds(0.0, 0.0, 1000.0, 1000.0));
+        // A frame at x in [-400, 400): its left pane [-400, 0) is fully
+        // hidden, its right pane [0, 400) visible.
+        let frame_mask = ContentMask::from_bounds(bounds(-400.0, 0.0, 800.0, 300.0));
+        let left_mask = ContentMask::from_bounds(bounds(-400.0, 0.0, 400.0, 300.0));
+        let right_mask = ContentMask::from_bounds(bounds(0.0, 0.0, 400.0, 300.0));
+        let quad = |b: crate::Bounds<ScaledPixels>, mask: ContentMask<ScaledPixels>| super::Quad {
+            bounds: b,
+            content_mask: mask,
+            ..Default::default()
+        };
+        let sprite = |b: crate::Bounds<ScaledPixels>, mask: ContentMask<ScaledPixels>| {
+            super::MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: b,
+                content_mask: mask,
+                color: Hsla::default(),
+                tile: AtlasTile {
+                    texture_id: AtlasTextureId {
+                        index: 0,
+                        kind: AtlasTextureKind::Monochrome,
+                    },
+                    tile_id: TileId(0),
+                    padding: 0,
+                    bounds: Default::default(),
+                },
+                transformation: TransformationMatrix::unit(),
+            }
+        };
+
+        let mut recorded = super::Scene::default();
+        let start = recorded.len();
+        // Frame surface, then the hidden left pane, then the visible right pane.
+        recorded.insert_primitive_clipped(quad(bounds(-400.0, 0.0, 800.0, 300.0), frame_mask).into(), Some(&clip), None);
+        recorded.insert_primitive_clipped(quad(bounds(-400.0, 0.0, 400.0, 300.0), left_mask).into(), Some(&clip), None);
+        recorded.insert_primitive_clipped(sprite(bounds(-300.0, 50.0, 10.0, 10.0), left_mask).into(), Some(&clip), None);
+        recorded.insert_primitive_clipped(quad(bounds(0.0, 0.0, 400.0, 300.0), right_mask).into(), Some(&clip), None);
+        recorded.insert_primitive_clipped(sprite(bounds(100.0, 50.0, 10.0, 10.0), right_mask).into(), Some(&clip), None);
+        let end = recorded.len();
+        assert_eq!(recorded.monochrome_sprites.len(), 1, "only the visible pane's glyph draws");
+
+        // The frame moves 500 px to the right: the left pane is now inside.
+        let mut next = super::Scene::default();
+        next.replay_translated(start..end, &recorded, point(ScaledPixels(500.0), ScaledPixels(0.0)), &clip);
+        assert_eq!(next.monochrome_sprites.len(), 2, "both glyphs draw after the move");
+        let left_glyph = next
+            .monochrome_sprites
+            .iter()
+            .find(|s| s.bounds.origin.x == ScaledPixels(200.0))
+            .expect("the hidden glyph is drawn at its moved position");
+        assert!(
+            !left_glyph.bounds.intersect(&left_glyph.content_mask.bounds).is_empty(),
+            "the moved glyph is inside its mask: {:?}",
+            left_glyph.content_mask.bounds
+        );
+        let covering = next
+            .quads
+            .iter()
+            .filter(|q| !q.bounds.intersect(&left_glyph.bounds).is_empty() && q.order >= left_glyph.order)
+            .count();
+        assert_eq!(
+            covering, 0,
+            "no quad draws at or above the revealed glyph's order (glyph order {}, quads {:?})",
+            left_glyph.order,
+            next.quads.iter().map(|q| (q.order, q.bounds.origin.x.0)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn replay_log_runs_end_on_range_boundaries_and_replay_one_to_one() {
+        use crate::{ContentMask, ScaledPixels, point, size};
+        let mask = ContentMask::from_bounds(crate::Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(100.0), ScaledPixels(100.0)),
+        });
+        let quad = |x: f32| super::Quad {
+            bounds: crate::Bounds {
+                origin: point(ScaledPixels(x), ScaledPixels(0.0)),
+                size: size(ScaledPixels(10.0), ScaledPixels(10.0)),
+            },
+            content_mask: mask,
+            ..Default::default()
+        };
+        let mut scene = super::Scene::default();
+        scene.insert_primitive(quad(0.0));
+        scene.insert_primitive(quad(20.0));
+        assert_eq!(scene.len(), 1, "same kind and mask join one run");
+        // `len` marks a range boundary: the next primitive starts a new run.
+        scene.insert_primitive(quad(40.0));
+        scene.insert_primitive(quad(60.0));
+        assert_eq!(scene.len(), 2);
+
+        let mut next = super::Scene::default();
+        next.replay(0..2, &scene, &mask);
+        assert_eq!(next.len(), 2, "a replayed operation stays one operation");
+        assert_eq!(next.quads.len(), 4);
+    }
+
     use super::*;
     use crate::size;
 
