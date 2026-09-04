@@ -353,21 +353,37 @@ impl Scene {
         // primitives that overlap and must keep their paint order (quads,
         // shadows, paths, underlines, effects, surfaces) stay on the stable
         // sort; sprites sort in place, since two sprites with the same order
-        // and the same atlas tile do not overlap in a way that depends on
-        // their relative order.
+        // and the same atlas texture do not overlap in a way that depends on
+        // their relative order. The renderer batches sprites by texture, not
+        // by tile, so the key stops at the texture: with one atlas texture
+        // the sprites arrive already ordered and the sort (a quicksort over
+        // tens of thousands of glyphs, ~15 % of a pan frame in Enjoy) is
+        // skipped.
         sort_stable_if_needed(&mut self.shadows, |shadow| shadow.order);
         sort_stable_if_needed(&mut self.quads, |quad| quad.order);
         sort_stable_if_needed(&mut self.effects, |effect| effect.order);
         sort_stable_if_needed(&mut self.paths, |path| path.order);
         sort_stable_if_needed(&mut self.underlines, |underline| underline.order);
         sort_unstable_if_needed(&mut self.monochrome_sprites, |sprite| {
-            (sprite.order, sprite.tile.tile_id)
+            (
+                sprite.order,
+                sprite.tile.texture_id.kind as u8,
+                sprite.tile.texture_id.index,
+            )
         });
         sort_unstable_if_needed(&mut self.subpixel_sprites, |sprite| {
-            (sprite.order, sprite.tile.tile_id)
+            (
+                sprite.order,
+                sprite.tile.texture_id.kind as u8,
+                sprite.tile.texture_id.index,
+            )
         });
         sort_unstable_if_needed(&mut self.polychrome_sprites, |sprite| {
-            (sprite.order, sprite.tile.tile_id)
+            (
+                sprite.order,
+                sprite.tile.texture_id.kind as u8,
+                sprite.tile.texture_id.index,
+            )
         });
         sort_stable_if_needed(&mut self.surfaces, |surface| surface.order);
     }
