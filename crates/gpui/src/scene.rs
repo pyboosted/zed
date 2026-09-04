@@ -247,12 +247,35 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        self.insert_primitive_clipped(primitive.into(), None);
+    }
+
+    /// Inserts `primitive` and records it in the replay log as given. With
+    /// `clip`, the drawn copy's content mask is additionally clipped by it
+    /// while the log keeps the mask the primitive was painted with: inside
+    /// a cached view that mask is the view-local one (see
+    /// `Window::begin_replay_island`) and `clip` is the mask of everything
+    /// above the view (the viewport), which a replay at another position
+    /// re-applies fresh. A primitive fully clipped now still goes into the
+    /// log then: it may be visible after the move.
+    pub(crate) fn insert_primitive_clipped(
+        &mut self,
+        logged: Primitive,
+        clip: Option<&ContentMask<ScaledPixels>>,
+    ) {
+        let mut primitive = logged.clone();
+        if let Some(clip) = clip {
+            primitive.set_content_mask(clip.intersect_unique(logged.content_mask()));
+        }
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
+            if clip.is_some() {
+                self.paint_operations
+                    .push(PaintOperation::Primitive(logged));
+            }
             return;
         }
 
@@ -304,38 +327,42 @@ impl Scene {
             }
         }
         self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+            .push(PaintOperation::Primitive(logged));
     }
 
-    pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        for operation in &prev_scene.paint_operations[range] {
-            match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
-                PaintOperation::EndLayer => self.pop_layer(),
-            }
-        }
+    /// Re-inserts the logged range. `clip` is the effective content mask at
+    /// the replay site: every logged primitive carries the mask recorded
+    /// inside its cached view, and the drawn copy is clipped by `clip` (see
+    /// [`Scene::insert_primitive_clipped`]).
+    pub(crate) fn replay(
+        &mut self,
+        range: Range<usize>,
+        prev_scene: &Scene,
+        clip: &ContentMask<ScaledPixels>,
+    ) {
+        self.replay_translated(range, prev_scene, Point::default(), clip);
     }
 
     /// [`Scene::replay`] with every replayed primitive moved by `offset`: a
-    /// cached view replayed at a new position (see
-    /// `Window::reuse_paint`). `view_bounds` are the view's bounds when the
-    /// range was painted; content masks that fully contained them belong to
-    /// ancestors the view is still inside of and stay where they are, the
-    /// others clip the view's own content and move with it.
-    pub fn replay_translated(
+    /// cached view replayed at a new position (see `Window::reuse_paint`).
+    /// The logged masks move with the primitives; `clip` (the effective mask
+    /// at the replay site) clips the drawn copies afterwards.
+    pub(crate) fn replay_translated(
         &mut self,
         range: Range<usize>,
         prev_scene: &Scene,
         offset: Point<ScaledPixels>,
-        view_bounds: Bounds<ScaledPixels>,
+        clip: &ContentMask<ScaledPixels>,
     ) {
+        let translated = offset != Point::default();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
-                    let mut primitive = primitive.clone();
-                    primitive.translate(offset, &view_bounds);
-                    self.insert_primitive(primitive);
+                    let mut logged = primitive.clone();
+                    if translated {
+                        logged.translate(offset);
+                    }
+                    self.insert_primitive_clipped(logged, Some(clip));
                 }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds + offset),
                 PaintOperation::EndLayer => self.pop_layer(),
@@ -516,62 +543,73 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
-    /// Moves the primitive by `offset`; see [`Scene::replay_translated`].
-    pub(crate) fn translate(
-        &mut self,
-        offset: Point<ScaledPixels>,
-        view_bounds: &Bounds<ScaledPixels>,
-    ) {
+    /// Moves the primitive and its recorded content mask by `offset`; see
+    /// [`Scene::replay_translated`].
+    pub(crate) fn translate(&mut self, offset: Point<ScaledPixels>) {
         match self {
             Primitive::Shadow(shadow) => {
                 shadow.bounds = shadow.bounds + offset;
                 shadow.element_bounds = shadow.element_bounds + offset;
-                shadow.content_mask = shadow.content_mask.translated_within(offset, view_bounds);
+                shadow.content_mask = shadow.content_mask.translated(offset);
             }
             Primitive::Quad(quad) => {
                 quad.bounds = quad.bounds + offset;
-                quad.content_mask = quad.content_mask.translated_within(offset, view_bounds);
+                quad.content_mask = quad.content_mask.translated(offset);
             }
             Primitive::Effect(effect) => {
                 effect.instance.bounds = effect.instance.bounds + offset;
-                effect.instance.content_mask = effect
-                    .instance
-                    .content_mask
-                    .translated_within(offset, view_bounds);
+                effect.instance.content_mask = effect.instance.content_mask.translated(offset);
             }
             Primitive::Path(path) => {
                 path.bounds = path.bounds + offset;
-                path.content_mask = path.content_mask.translated_within(offset, view_bounds);
+                path.content_mask = path.content_mask.translated(offset);
                 path.start = path.start + offset;
                 path.current = path.current + offset;
                 for vertex in &mut path.vertices {
                     vertex.xy_position = vertex.xy_position + offset;
-                    vertex.content_mask =
-                        vertex.content_mask.translated_within(offset, view_bounds);
+                    vertex.content_mask = vertex.content_mask.translated(offset);
                 }
             }
             Primitive::Underline(underline) => {
                 underline.bounds = underline.bounds + offset;
-                underline.content_mask = underline
-                    .content_mask
-                    .translated_within(offset, view_bounds);
+                underline.content_mask = underline.content_mask.translated(offset);
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.bounds = sprite.bounds + offset;
-                sprite.content_mask = sprite.content_mask.translated_within(offset, view_bounds);
+                sprite.content_mask = sprite.content_mask.translated(offset);
             }
             Primitive::SubpixelSprite(sprite) => {
                 sprite.bounds = sprite.bounds + offset;
-                sprite.content_mask = sprite.content_mask.translated_within(offset, view_bounds);
+                sprite.content_mask = sprite.content_mask.translated(offset);
             }
             Primitive::PolychromeSprite(sprite) => {
                 sprite.bounds = sprite.bounds + offset;
-                sprite.content_mask = sprite.content_mask.translated_within(offset, view_bounds);
+                sprite.content_mask = sprite.content_mask.translated(offset);
             }
             Primitive::Surface(surface) => {
                 surface.bounds = surface.bounds + offset;
-                surface.content_mask = surface.content_mask.translated_within(offset, view_bounds);
+                surface.content_mask = surface.content_mask.translated(offset);
             }
+        }
+    }
+
+    /// Replaces the content mask (a path's vertices carry copies of it).
+    pub(crate) fn set_content_mask(&mut self, mask: ContentMask<ScaledPixels>) {
+        match self {
+            Primitive::Shadow(shadow) => shadow.content_mask = mask,
+            Primitive::Quad(quad) => quad.content_mask = mask,
+            Primitive::Effect(effect) => effect.instance.content_mask = mask,
+            Primitive::Path(path) => {
+                path.content_mask = mask;
+                for vertex in &mut path.vertices {
+                    vertex.content_mask = mask;
+                }
+            }
+            Primitive::Underline(underline) => underline.content_mask = mask,
+            Primitive::MonochromeSprite(sprite) => sprite.content_mask = mask,
+            Primitive::SubpixelSprite(sprite) => sprite.content_mask = mask,
+            Primitive::PolychromeSprite(sprite) => sprite.content_mask = mask,
+            Primitive::Surface(surface) => surface.content_mask = mask,
         }
     }
 

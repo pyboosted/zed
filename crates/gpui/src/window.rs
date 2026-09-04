@@ -1260,6 +1260,12 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// Set while the outermost cached view paints (`begin_replay_island`):
+    /// the effective content mask above that view and the depth of the mask
+    /// stack when it began. Inside, `content_mask` is view-local (the masks
+    /// pushed since), so primitives are recorded and culled relative to the
+    /// view; `insert_primitive` clips the drawn copies by the ancestor mask.
+    replay_island: Option<ReplayIsland>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -2145,6 +2151,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            replay_island: None,
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -2286,6 +2293,20 @@ impl<P> ContentMask<P>
 where
     P: Clone + Debug + Default + PartialEq + PartialOrd + Copy + std::ops::Add<Output = P>,
 {
+    /// The mask moved by `offset`, rounded clips included.
+    pub(crate) fn translated(&self, offset: Point<P>) -> Self {
+        let mut mask = *self;
+        mask.bounds = mask.bounds + offset;
+        for clip in mask
+            .rounded_clips
+            .iter_mut()
+            .take(mask.rounded_clip_count as usize)
+        {
+            clip.bounds = clip.bounds + offset;
+        }
+        mask
+    }
+
     /// The mask moved by `offset`, except for the parts that fully contained
     /// `view_bounds`: those come from ancestors the moved view is still
     /// inside of (a viewport clip) and must not move with it.
@@ -2315,6 +2336,96 @@ where
         && outer.origin.y <= inner.origin.y
         && outer.origin.x + outer.size.width >= inner.origin.x + inner.size.width
         && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height
+}
+
+/// See `Window::begin_replay_island`.
+pub(crate) struct ReplayIsland {
+    /// The effective content mask above the cached view.
+    ancestor: ContentMask<Pixels>,
+    /// `content_mask_stack.len()` when the island began.
+    depth: usize,
+}
+
+impl ContentMask<Pixels> {
+    /// A mask that clips nothing: the content mask inside a cached view's
+    /// paint before the view pushes one of its own (see
+    /// `Window::begin_replay_island`).
+    pub(crate) fn unbounded() -> Self {
+        const EXTENT: f32 = 1.0e7;
+        ContentMask::from_bounds(Bounds {
+            origin: Point::new(Pixels(-EXTENT), Pixels(-EXTENT)),
+            size: Size::new(Pixels(2.0 * EXTENT), Pixels(2.0 * EXTENT)),
+        })
+    }
+}
+
+impl ContentMask<ScaledPixels> {
+    /// `self` clipped by `other`, without repeating rounded clips `self`
+    /// already carries. A replayed primitive's logged mask holds the clips
+    /// pushed since the outermost cached view began; when a nested cached
+    /// view replays on its own, the mask at its site repeats the outer
+    /// view's clips, and they must not be applied (or counted) twice.
+    pub(crate) fn intersect_unique(&self, other: &Self) -> Self {
+        let mut mask = ContentMask::from_bounds(self.bounds.intersect(&other.bounds));
+        for clip in self
+            .rounded_clips
+            .iter()
+            .take(self.rounded_clip_count as usize)
+        {
+            mask.push_rounded_clip(clip.bounds, clip.corner_radii);
+        }
+        for clip in other
+            .rounded_clips
+            .iter()
+            .take(other.rounded_clip_count as usize)
+        {
+            let repeated = self
+                .rounded_clips
+                .iter()
+                .take(self.rounded_clip_count as usize)
+                .any(|own| own == clip);
+            if !repeated {
+                mask.push_rounded_clip(clip.bounds, clip.corner_radii);
+            }
+        }
+        mask
+    }
+
+    /// Intersect the content mask with the given content mask.
+    pub(crate) fn intersect(&self, other: &Self) -> Self {
+        let mut mask = ContentMask::from_bounds(self.bounds.intersect(&other.bounds));
+        let total_clips = self.rounded_clip_count as usize + other.rounded_clip_count as usize;
+        debug_assert!(
+            total_clips <= CONTENT_MASK_ROUNDED_CLIP_CAPACITY,
+            "content mask rounded clip capacity exceeded"
+        );
+
+        for clip in self
+            .rounded_clips
+            .iter()
+            .take(self.rounded_clip_count as usize)
+            .chain(
+                other
+                    .rounded_clips
+                    .iter()
+                    .take(other.rounded_clip_count as usize),
+            )
+        {
+            mask.push_rounded_clip(clip.bounds, clip.corner_radii);
+        }
+
+        mask
+    }
+
+    /// A mask that clips nothing: the replay-log mask of a primitive painted
+    /// in a cached view that pushed no mask of its own.
+    pub(crate) fn unbounded() -> Self {
+        const EXTENT: f32 = 1.0e7;
+        ContentMask::from_bounds(Bounds {
+            origin: Point::new(ScaledPixels(-EXTENT), ScaledPixels(-EXTENT)),
+            size: Size::new(ScaledPixels(2.0 * EXTENT), ScaledPixels(2.0 * EXTENT)),
+        })
+    }
 }
 
 impl ContentMask<Pixels> {
@@ -4201,18 +4312,23 @@ impl Window {
         self.text_system.reuse_layouts(
             range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
         );
+        // The logged primitives carry the masks recorded inside the view;
+        // the clip of everything above it (the viewport) is applied fresh
+        // here, so a view that crosses the viewport edge replays as well.
+        let scale_factor = self.scale_factor();
+        let clip = self.effective_content_mask().scale(scale_factor);
         if translated {
-            let scale_factor = self.scale_factor();
             self.next_frame.scene.replay_translated(
                 range.start.scene_index..range.end.scene_index,
                 &self.rendered_frame.scene,
                 offset.scale(scale_factor),
-                view_bounds.scale(scale_factor),
+                &clip,
             );
         } else {
             self.next_frame.scene.replay(
                 range.start.scene_index..range.end.scene_index,
                 &self.rendered_frame.scene,
+                &clip,
             );
         }
         #[cfg(any(test, feature = "test-support"))]
@@ -4480,12 +4596,68 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
+        if let Some(island) = &self.replay_island {
+            // Inside a cached view's paint the mask is view-local: the
+            // masks pushed since the view began, or nothing at all.
+            return if self.content_mask_stack.len() > island.depth {
+                self.content_mask_stack.last().cloned().unwrap()
+            } else {
+                ContentMask::<Pixels>::unbounded()
+            };
+        }
         self.content_mask_stack.last().cloned().unwrap_or_else(|| {
             ContentMask::from_bounds(Bounds {
                 origin: Point::default(),
                 size: self.viewport_size,
             })
         })
+    }
+
+    /// The content mask with every ancestor applied, also inside a replay
+    /// island (where `content_mask` is view-local).
+    pub(crate) fn effective_content_mask(&self) -> ContentMask<Pixels> {
+        let mask = self.content_mask();
+        match &self.replay_island {
+            Some(island) => island.ancestor.intersect(&mask),
+            None => mask,
+        }
+    }
+
+    /// Starts a replay island for a cached view's prepaint or paint: until
+    /// `end_replay_island`, `content_mask` is view-local, so the elements
+    /// lay out, paint, cull and log relative to the view, and only the
+    /// drawn copies (and hitboxes) are clipped by the mask above the view. A replay at
+    /// another position re-applies that outer clip fresh (`reuse_paint`), so
+    /// a view crossing the viewport edge replays too. Nested cached views
+    /// share the outermost island (their log is relative to it, which is
+    /// what a replay of the outer view needs; an inner replay meets the
+    /// same outer masks again, which `intersect_unique` folds). Returns
+    /// whether an island was started; only then end it.
+    pub(crate) fn begin_replay_island(&mut self) -> bool {
+        if self.replay_island.is_some() {
+            return false;
+        }
+        let ancestor = self.content_mask();
+        self.replay_island = Some(ReplayIsland {
+            ancestor,
+            depth: self.content_mask_stack.len(),
+        });
+        true
+    }
+
+    /// Ends the island started by `begin_replay_island`.
+    pub(crate) fn end_replay_island(&mut self) {
+        self.replay_island = None;
+    }
+
+    fn insert_primitive(&mut self, primitive: impl Into<crate::scene::Primitive>) {
+        let clip = self
+            .replay_island
+            .as_ref()
+            .map(|island| island.ancestor.scale(self.scale_factor()));
+        self.next_frame
+            .scene
+            .insert_primitive_clipped(primitive.into(), clip.as_ref());
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
@@ -4748,7 +4920,7 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
-            self.next_frame.scene.insert_primitive(Shadow {
+            self.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
@@ -4793,7 +4965,7 @@ impl Window {
                 bottom_right: (corner_radii.bottom_right - shadow.spread_radius).max(zero),
                 bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
             };
-            self.next_frame.scene.insert_primitive(Shadow {
+            self.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(hole),
@@ -4835,7 +5007,7 @@ impl Window {
         };
 
         if !quad.background.is_transparent() {
-            self.next_frame.scene.insert_primitive(quad);
+            self.insert_primitive(quad);
             return;
         }
 
@@ -4864,7 +5036,7 @@ impl Window {
         );
 
         if inner_bounds.is_empty() {
-            self.next_frame.scene.insert_primitive(quad);
+            self.insert_primitive(quad);
             return;
         }
 
@@ -4894,7 +5066,7 @@ impl Window {
         for strip in strips {
             let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
             if !content_mask_bounds.is_empty() {
-                self.next_frame.scene.insert_primitive(Quad {
+                self.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
                         ..quad.content_mask
@@ -4912,7 +5084,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let opacity = self.element_opacity();
-        self.next_frame.scene.insert_primitive(EffectPrimitive {
+        self.insert_primitive(EffectPrimitive {
             instance: EffectQuad {
                 order: 0,
                 kind: effect.kind as u32,
@@ -4972,7 +5144,7 @@ impl Window {
         };
         let element_opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(Underline {
+        self.insert_primitive(Underline {
             order: 0,
             pad: 0,
             bounds,
@@ -5002,7 +5174,7 @@ impl Window {
         };
         let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(Underline {
+        self.insert_primitive(Underline {
             order: 0,
             pad: 0,
             bounds,
@@ -5075,7 +5247,7 @@ impl Window {
             let content_mask = self.snapped_content_mask();
 
             if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
+                self.insert_primitive(SubpixelSprite {
                     order: 0,
                     pad: 0,
                     bounds,
@@ -5085,7 +5257,7 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
+                self.insert_primitive(MonochromeSprite {
                     order: 0,
                     pad: 0,
                     bounds,
@@ -5166,7 +5338,7 @@ impl Window {
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
-            self.next_frame.scene.insert_primitive(PolychromeSprite {
+            self.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
                 grayscale: false.into(),
@@ -5232,7 +5404,7 @@ impl Window {
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
             .map_size(|size| size.ceil());
 
-        self.next_frame.scene.insert_primitive(MonochromeSprite {
+        self.insert_primitive(MonochromeSprite {
             order: 0,
             pad: 0,
             bounds: final_bounds,
@@ -5281,7 +5453,7 @@ impl Window {
         let corner_radii = corner_radii.scale(self.scale_factor());
         let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(PolychromeSprite {
+        self.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale: grayscale.into(),
@@ -5305,7 +5477,7 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
-        self.next_frame.scene.insert_primitive(PaintSurface {
+        self.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
@@ -5422,7 +5594,9 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        // Hit testing stays clipped by every ancestor, also inside a replay
+        // island where `content_mask` is view-local.
+        let content_mask = self.effective_content_mask();
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {

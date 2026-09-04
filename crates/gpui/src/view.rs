@@ -437,17 +437,14 @@ impl<V: View> Element for ViewElement<V> {
                         {
                             let previous_bounds = element_state.cache_key.bounds;
                             let translation = bounds.origin - previous_bounds.origin;
+                            // A moved view replays whether or not it lies
+                            // fully inside the content mask: its primitives
+                            // were logged with the masks pushed inside the
+                            // view and the mask above it (the viewport) is
+                            // re-applied at replay (`Window::reuse_paint`).
                             let replayable = translation == Point::default()
                                 || (window.cached_view_translation_replay
                                     && previous_bounds.size == bounds.size
-                                    && crate::window::bounds_encloses(
-                                        &content_mask.bounds,
-                                        &previous_bounds,
-                                    )
-                                    && crate::window::bounds_encloses(
-                                        &content_mask.bounds,
-                                        &bounds,
-                                    )
                                     && !window.prepaint_range_has_deferred_draws(
                                         &element_state.prepaint_range,
                                     ));
@@ -477,6 +474,11 @@ impl<V: View> Element for ViewElement<V> {
                         // tree. Before, a dirty pane body re-rendered every
                         // other body of its frame through this flag.
                         let prepaint_start = window.prepaint_index();
+                        // Prepaint inside a replay island too: elements that
+                        // lay out only what the content mask shows (rows of
+                        // a terminal) must cover the whole view for its
+                        // replay at another position to be complete.
+                        let island = window.begin_replay_island();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                             let mut element = self
                                 .view
@@ -488,6 +490,9 @@ impl<V: View> Element for ViewElement<V> {
                             element.prepaint_at(bounds.origin, window, cx);
                             element
                         });
+                        if island {
+                            window.end_replay_island();
+                        }
 
                         let prepaint_end = window.prepaint_index();
 
@@ -544,7 +549,11 @@ impl<V: View> Element for ViewElement<V> {
                             let paint_start = window.paint_index();
 
                             if let Some(element) = element {
+                                let island = window.begin_replay_island();
                                 element.paint(window, cx);
+                                if island {
+                                    window.end_replay_island();
+                                }
                                 element_state.painted_bounds = element_state.cache_key.bounds;
                             } else {
                                 let translation = mem::take(&mut element_state.pending_translation);
